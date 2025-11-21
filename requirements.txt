@@ -1,0 +1,8 @@
+torch>=2.0.0       # 推荐使用 PyTorch 2.0+ 以获得更好的性能 (Flash Attention)
+transformers>=4.36.0  # 确保对 HuBERT Config 的完美解析
+librosa>=0.10.0    # 音频处理
+numpy>=1.24.0
+scikit-learn       # 用于评估指标
+tqdm               # 进度条
+tensorboard        # 实验可视化
+hydra-core         # 推荐：用于管理复杂的配置 (config.yaml)
