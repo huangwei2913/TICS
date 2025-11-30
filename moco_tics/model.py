@@ -4,6 +4,8 @@ import copy
 from torch.nn.utils.rnn import pad_sequence
 from .modules import * # 导入所有基础组件
 from .encoder import SegmentEncoder
+import torch.nn.functional as F
+from util.utils import load_large_weights_tolerant
 
 class TICS_MoCo(nn.Module):
     def __init__(self, 
@@ -15,8 +17,9 @@ class TICS_MoCo(nn.Module):
         
         # --- A. 共享组件 (Base Encoder) ---
         # 这些部分负责生成片段，既用于 Query 也用于 Key
+        self.fusion_layers = [2, 5, 9]
         self.backbone = FrozenHubertBackbone(backbone_path)
-        self.fusion = FeatureFusion(dim=768, layers_to_use=[2,5,9])
+        self.fusion = FeatureFusion(dim=768, layers_to_use=self.fusion_layers)
         self.student = TICSBoundaryStudent(input_dim=768)
         self.hardener = SCPCBoundaryHardener()
         
@@ -27,6 +30,10 @@ class TICS_MoCo(nn.Module):
         # Query Encoder (可训练教师)
         self.encoder_q = SegmentEncoder(**teacher_config)
         #self.encoder_q.load_xlarge_weights() # 加载强权重
+        load_large_weights_tolerant(
+            target_model=self.encoder_q , 
+            large_checkpoint_path="/mnt/facebook/hubert-large-ls960-ft"
+        )
         
         # Key Encoder (动量教师)
         self.encoder_k = copy.deepcopy(self.encoder_q)
@@ -49,8 +56,16 @@ class TICS_MoCo(nn.Module):
     def forward_single_view(self, wav, encoder_type='q'):
         """执行单视图的前向传播：从波形到片段嵌入"""
         
+
+        feature_list = self.backbone(wav, layers_to_extract=self.fusion_layers)
+        feats_dict = {
+            layer_idx: feat 
+            for layer_idx, feat in zip(self.fusion_layers, feature_list)
+        }
         # 1. 提取特征 (Backbone + Fusion)
-        feats_dict = self.backbone(wav)
+        #feats_dict = self.backbone(wav,layers_to_extract=self.fusion_layers)
+
+
         seq_feat, fused_cls = self.fusion(feats_dict)
         
         # 2. 预测边界 (Student)
@@ -102,9 +117,18 @@ class TICS_MoCo(nn.Module):
         # --- 3. 预测头 ---
         p_q1 = self.predictor(z_q1)
         p_q2 = self.predictor(z_q2)
-        
+
+        p_q1 = F.normalize(p_q1, dim=-1)
+        p_q2 = F.normalize(p_q2, dim=-1)
+        z_k1 = F.normalize(z_k1, dim=-1)
+        z_k2 = F.normalize(z_k2, dim=-1)
+
+
         # --- 4. 返回嵌入供 Loss 模块使用 ---
         return {
-            "q1": p_q1, "k2": z_k2, "mask_q1": mask_q1,
-            "q2": p_q2, "k1": z_k1, "mask_q2": mask_q2
+            "q1": p_q1, "k2": z_k2, "mask_q1": mask_q1, 
+            "len_q1": len_q1, "len_k2": len_k2, # 第一组长度
+            
+            "q2": p_q2, "k1": z_k1, "mask_q2": mask_q2,
+            "len_q2": len_q2, "len_k1": len_k1  # <--- 必须添加这两项！
         }
