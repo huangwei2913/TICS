@@ -1,2 +1,24 @@
-在本项目中，我们使用无监督对比学习来对音频流进行语义分割
-在data目录，建立一种机制来
+TICS/
+├── moco_tics/
+│   ├── model.py         # 包含 TICS_MoCo (带 forward_stage2)
+│   ├── data_loader.py   # 包含修正后的 collate_fn (padding_value=1)
+│   └── ...
+├── train_stage1.py      # 第一阶段：对比学习 + 边界监督
+├── train_stage2.py      # 第二阶段：语义蒸馏 + 边界监督
+├── ds_config_stage2.json # 你刚拿到的 ZeRO-2 配置文件
+└── ...
+
+
+Step 1: 启动阶段一训练
+deepspeed --num_gpus=2 train_stage1.py \
+    --deepspeed \
+    --deepspeed_config ds_config_stage1.json \
+    --csv_path path/to/your_metadata.csv
+
+
+Step 2: 确认阶段一产出 .pt 后，启动阶段二
+deepspeed --num_gpus=2 train_stage2.py \
+    --deepspeed \
+    --deepspeed_config ds_config_stage2.json \
+    --csv_path path/to/your_metadata.csv \
+    --stage1_checkpoint ./checkpoints_stage1/best_model.pt
