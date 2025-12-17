@@ -4,147 +4,177 @@ import numpy as np
 import random
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from typing import List, Tuple
-import torch
-import torchaudio
-import pandas as pd # <-- 缺少这一行
-import random
+from transformers import XLMRobertaTokenizer
+from typing import List, Tuple, Dict
+import pandas as pd
 import os
+import json
 
-# --- 辅助函数：读取 CSV 路径列表 ---
-def load_audio_paths_from_csv(csv_path: str) -> List[str]:
-    """
-    从 Aishell-1 的元数据 CSV 中加载音频相对路径列表。
-    """
-    try:
-        # 假设 CSV 格式为 'Audio:FILE,Text:LABEL'，我们只需要第一列
-        df = pd.read_csv(csv_path, header=0, usecols=[0], names=['AudioPath'])
-        return df['AudioPath'].tolist()
-    except Exception as e:
-        print(f"Error reading CSV at {csv_path}: {e}")
-        raise
+class BoundaryLabelGenerator:
+    def __init__(self, fps=50):
+        self.fps = fps
 
-# --- 1. 数据增强和变换函数 ---
+    def generate(self, json_path: str, target_frames: int) -> torch.Tensor:
+        """
+        基于给定的帧数生成 0/1 序列
+        """
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            y_true = torch.zeros(target_frames, dtype=torch.float32)
+            words = data.get('words', data.get('word_segments', []))
+            
+            for word in words:
+                # 提取词边界结束时间
+                end_time = word['end']
+                # 转换到帧索引: frame = time * 50
+                frame_idx = int(round(end_time * self.fps))
+                
+                # 严格边界检查：防止计算出的索引超出特征长度
+                if frame_idx < target_frames:
+                    y_true[frame_idx] = 1.0
+                elif frame_idx == target_frames: # 容错处理
+                    y_true[target_frames - 1] = 1.0
+                    
+            return y_true
+        except Exception as e:
+            # 如果 JSON 损坏，返回全 0，防止训练中断
+            return torch.zeros(target_frames, dtype=torch.float32)
 
-def apply_audio_augmentation(waveform: torch.Tensor, is_view2: bool) -> torch.Tensor:
-    """
-    对音频应用不同的增强策略，用于生成两个视图。
-    
-    Args:
-        waveform: (1, L) 原始音频波形张量。
-        is_view2: 是否为 View 2 (应用时间反转)。
-    
-    Returns:
-        增强后的波形。
-    """
-    
-    # View 1: 标准增强 (例如，随机增益和噪声，这里为简化只做随机增益)
-    if not is_view2:
-        # 随机增益
-        gain = random.uniform(0.8, 1.2)
-        waveform = waveform * gain
-        
-    # View 2: 时间反转 (实现您要求的“反向音频”) + 随机增益
-    else:
-        # 理由：时间反转是核心变换，测试模型的时序不变性
-        waveform = torch.flip(waveform, dims=[1])
-        
-        # 应用随机增益 (保持与 View 1 类似的幅度变化)
-        gain = random.uniform(0.8, 1.2)
-        waveform = waveform * gain
-        
-    # 裁剪到 [-1, 1]
-    return torch.clamp(waveform, -1.0, 1.0)
-
-
-# --- 2. 数据集类 ---
-
-# --- 2. 数据集类 (已更新为 CSV 解析) ---
 class TICSDataset(Dataset):
-    """
-    TICS 自监督训练数据集，从 CSV 加载路径并返回同一音频的两个增强视图。
-    """
-    def __init__(self, csv_path: str, data_root: str, sample_rate: int = 16000):
-        # 加载所有相对路径
-        self.relative_audio_paths = load_audio_paths_from_csv(csv_path)
-        # 确保 data_root 是绝对路径，并且结尾没有斜杠
-        self.data_root = os.path.abspath(data_root)
+    def __init__(self, csv_path: str, sample_rate: int = 16000, xlmr_path="/mnt/facebook/xlm-roberta-large", stage=1):
+        """
+        csv_path: 第一列 wav 路径, 第二列 json 路径
+        """
+        self.stage = stage
+        self.tokenizer = XLMRobertaTokenizer.from_pretrained(xlmr_path)
+        df = pd.read_csv(csv_path, header=None) # 假设没有表头，或者您指定 header=0
+        self.audio_files = df.iloc[:, 0].tolist()
+        self.json_files = df.iloc[:, 1].tolist()
+        
         self.sample_rate = sample_rate
+        self.label_gen = BoundaryLabelGenerator(fps=50)
 
     def __len__(self):
-        return len(self.relative_audio_paths)
+        return len(self.audio_files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        
-        relative_path = self.relative_audio_paths[idx]
-        
-        # 核心：组合绝对路径，例如 /mnt/speech_asr_aishell_trainsets/wav/train/...
-        full_path = os.path.join(self.data_root, relative_path)
-        
-        try:
-            waveform, sr = torchaudio.load(full_path)
-        except Exception as e:
-            print(f"Skipping corrupt or unreadable file: {full_path}. Error: {e}")
-            # 返回一个空占位符，由 collate_fn 过滤，或直接抛出错误
-            raise IndexError(f"Error loading file: {full_path}")
-        
-        # 确保采样率一致 (如果需要)
-        if sr != self.sample_rate:
-             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
-             waveform = resampler(waveform)
+    def _apply_augmentation(self, waveform: torch.Tensor, is_view2: bool) -> torch.Tensor:
+        # View 1: 原始/简单增益
+        # View 2: 时间反转 + 增益
+        # 注意：此处只做非变速增强，确保时间轴一致
+        aug_wav = waveform.clone()
+        if is_view2:
+            aug_wav = torch.flip(aug_wav, dims=[1])
+            
+        gain = random.uniform(0.8, 1.2)
+        aug_wav = aug_wav * gain
+        return torch.clamp(aug_wav, -1.0, 1.0)
 
-        # 确保是单声道 (1, L)
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        audio_path = self.audio_files[idx]
+        json_path = self.json_files[idx]
+
+
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+
+        # 1. 加载音频
+        waveform, sr = torchaudio.load(audio_path)
+        
+        # 强制单声道
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
-
-        # View 1: 正向音频 + 标准增强
-        view1_wav = apply_audio_augmentation(waveform, is_view2=False)
+            
+        # 2. 计算 HuBERT 预期的特征帧数
+        # HuBERT Stride 是 320 (20ms)，所以 T = L // 320
+        target_T = waveform.shape[1] // 320
         
-        # View 2: 反向音频 + 标准增强 (时间反转)
-        view2_wav = apply_audio_augmentation(waveform, is_view2=True)
-        
-        return view1_wav.squeeze(0), view2_wav.squeeze(0) # 变为 (L,) 方便 collate
+        if target_T == 0: # 过滤极短音频
+            return self.__getitem__((idx + 1) % len(self))
 
-# --- 3. 批次整理函数 (Collate Function) ---
+        # 3. 生成 Y_true
+        y_true = self.label_gen.generate(json_path, target_T)
 
-def tics_collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 4. 生成两个增强视图
+        view1 = self._apply_augmentation(waveform, is_view2=False)
+        view2 = self._apply_augmentation(waveform, is_view2=True)
+
+        if self.stage == 2:
+            # 4. 文本 Token 处理 (Stage 2 专属)
+            text = meta['text']
+            # 对文本进行编码
+            encoded_text = self.tokenizer(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=128,  # 根据你的平均句长调整
+                return_tensors='pt'
+            )
+            
+            return {
+                "view1": view1, # 语音张量
+                "y_true": y_true, # 边界标签
+                "text_ids": encoded_text['input_ids'].squeeze(0),
+                "text_mask": encoded_text['attention_mask'].squeeze(0)
+            }
+
+
+        return {
+            "view1": view1.squeeze(0),
+            "view2": view2.squeeze(0),
+            "y_true": y_true
+        }
+
+
+def tics_collate_fn(batch):
     """
-    将批次中的可变长音频波形填充到批次中的最大长度。
-    
-    Args:
-        batch: 一个包含 (View1_wav, View2_wav) 元组的列表。
-        
-    Returns:
-        (padded_view1, padded_view2) 两个填充后的张量 (B, L_max)。
+    兼容 Stage I 和 Stage II 的动态 Padding 函数
     """
-    # 将 View 1 和 View 2 分离
-    view1_list = [item[0] for item in batch]
-    view2_list = [item[1] for item in batch]
+    # 1. 基础项提取 (所有阶段共有)
+    view1_list = [item['view1'] for item in batch]
+    y_true_list = [item['y_true'] for item in batch]
     
-    # 理由： pad_sequence 可以高效地处理可变长度并进行零填充
-    
-    # 填充 View 1
-    # batch_first=True -> (B, L_max)
+    # 对音频和边界标签进行 Padding
     padded_view1 = pad_sequence(view1_list, batch_first=True, padding_value=0.0)
+    padded_y_true = pad_sequence(y_true_list, batch_first=True, padding_value=0.0)
     
-    # 填充 View 2
-    padded_view2 = pad_sequence(view2_list, batch_first=True, padding_value=0.0)
+    # 生成音频掩码 y_mask (用于 Boundary Loss 排除 padding 部分)
+    # y_true 形状为 (B, T)，y_mask 在有效长度为 1，padding 为 0
+    lengths = [len(y) for y in y_true_list]
+    max_len = max(lengths)
+    y_mask = torch.zeros((len(batch), max_len), dtype=torch.float32)
+    for i, l in enumerate(lengths):
+        y_mask[i, :l] = 1.0
 
-    # Note: 填充后的波形需要传递给 TICS_MoCo.forward
-    # TICS_MoCo 内部的 FrozenHuBERT Backbone 会自行处理 padding/masking
-    
-    return padded_view1, padded_view2
+    # 构造基础返回字典
+    output = {
+        "view1": padded_view1,
+        "y_true": padded_y_true,
+        "y_mask": y_mask
+    }
+
+    # 2. Stage I 特有项：处理 view2 (对比视图)
+    if 'view2' in batch[0]:
+        view2_list = [item['view2'] for item in batch]
+        output["view2"] = pad_sequence(view2_list, batch_first=True, padding_value=0.0)
+
+    # 3. Stage II 特有项：处理文本 Token
+    if 'text_ids' in batch[0]:
+        text_ids_list = [item['text_ids'] for item in batch]
+        text_mask_list = [item['text_mask'] for item in batch]
+        
+        # 文本通常在 Dataset 里已经固定了 max_length，但保险起见这里再做一次 pad
+        output["text_ids"] = pad_sequence(text_ids_list, batch_first=True, padding_value=1) # XLM-R pad ID 通常是 1，请根据 tokenizer 确认
+        output["text_mask"] = pad_sequence(text_mask_list, batch_first=True, padding_value=0.0)
+
+    return output
 
 
-# --- 示例 DataLoader 构造 ---
-def get_tics_dataloader(audio_paths: List[str], batch_size: int, num_workers: int):
-    """
-    用于在 scripts/train.py 中实例化 DataLoader
-    """
-    dataset = TICSDataset(audio_paths)
-    
-    # 理由：使用 tics_collate_fn 来确保变长音频的正确批次化
-    dataloader = DataLoader(
+
+def get_tics_dataloader(csv_path: str, batch_size: int, num_workers: int):
+    dataset = TICSDataset(csv_path)
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
@@ -152,4 +182,3 @@ def get_tics_dataloader(audio_paths: List[str], batch_size: int, num_workers: in
         collate_fn=tics_collate_fn,
         pin_memory=True
     )
-    return dataloader

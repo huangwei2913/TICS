@@ -204,98 +204,121 @@ import torch.nn as nn
 
 class TICSBoundaryStudent(nn.Module):
     """
-    TICS Student 边界预测网络：
+    TICS Student 边界预测网络（增强版）：
     1. 使用局部序列特征 (seq_feat) 作为 Bi-LSTM 的输入。
     2. 使用全局融合特征 (fused_cls) 来初始化 Bi-LSTM 的初始隐藏状态 (h0, c0)。
-    3. Bi-LSTM 捕获上下文后，通过 FC 层映射到边界概率。
+    3. **新增：残差连接 + LayerNorm**，提升深层训练稳定性。
+    4. Bi-LSTM 捕获上下文后，通过 FC 层映射到边界概率。
     """
-    def __init__(self, input_dim=768, hidden_dim=256, dropout=0.1, num_lstm_layers=8):
+    def __init__(self, input_dim=768, hidden_dim=512, dropout=0.1, num_lstm_layers=12):
         """
         Args:
             input_dim (int): 序列特征 (seq_feat) 和全局特征 (fused_cls) 的维度 (如 HuBERT 的 768)。
-            hidden_dim (int): LSTM 隐藏状态的维度 (如 256)。
+            hidden_dim (int): LSTM 隐藏状态的维度 (512，提升容量)。
             dropout (float): LSTM 层间 Dropout 率。
-            num_lstm_layers (int): LSTM 的层数。
+            num_lstm_layers (int): LSTM 的层数 (12，提升容量)。
         """
         super().__init__()
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_lstm_layers = num_lstm_layers
-        self.num_directions = 2 # 双向 LSTM
+        self.num_directions = 2  # 双向 LSTM
+        self.output_dim = hidden_dim * self.num_directions  # 1024
         
-        # 1. Bi-LSTM 网络
-        # 输入维度为 seq_feat 的维度 (768)，不再是 2*768
+        # 1. Bi-LSTM 网络（增强容量）
         self.lstm = nn.LSTM(
             input_size=input_dim,          # 768
-            hidden_size=hidden_dim,        # 256
-            num_layers=num_lstm_layers,    # 2
+            hidden_size=hidden_dim,        # 512
+            num_layers=num_lstm_layers,    # 12
             batch_first=True, 
             bidirectional=True, 
             dropout=dropout
         )
         
-        # 2. 初始状态投影层 (用于状态初始化)
-        # 将 fused_cls (input_dim=768) 投影到 h0 和 c0 的维度 (hidden_dim=256)
-        # 每个状态需要一个独立的线性层
+        # 2. **新增：输入投影层（维度适配残差连接）**
+        # seq_feat (B,T,768) -> lstm_input (B,T,1024)，为残差做准备
+        self.input_proj = nn.Linear(input_dim, self.output_dim)
+        
+        # 3. **新增：LayerNorm（LSTM 输出后归一化）**
+        self.lstm_norm = nn.LayerNorm(self.output_dim)
+        
+        # 4. **新增：残差投影层（输入维度适配）**
+        # 将输入投影到输出维度，用于残差连接
+        self.residual_proj = nn.Linear(input_dim, self.output_dim)
+        
+        # 5. **新增：Post-LSTM Dropout**
+        self.lstm_dropout = nn.Dropout(dropout)
+        
+        # 6. 初始状态投影层 (用于状态初始化)
         self.cls_h0_projection = nn.Linear(input_dim, hidden_dim)
         self.cls_c0_projection = nn.Linear(input_dim, hidden_dim)
         
-        # 3. 预测头 (FC 层)
-        # 输入维度: Bi-LSTM 的输出 (hidden_dim * 2) 
-        # 输出维度: 边界 Logits (1)
-        self.fc = nn.Linear(hidden_dim * self.num_directions, 1)
+        # 7. 预测头 (FC 层)
+        self.fc = nn.Sequential(
+            nn.Linear(self.output_dim, self.output_dim // 2),  # 1024 -> 512
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.output_dim // 2, 1)  # 512 -> 1
+        )
         
-        # 4. 激活函数
+        # 8. 激活函数
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, seq_feat: torch.Tensor, fused_cls: torch.Tensor) -> torch.Tensor:
+    def forward(self, seq_feat: torch.Tensor, fused_cls: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            seq_feat: (B, T, D) - 局部序列特征
-            fused_cls: (B, D) - 全局融合特征 (从 FeatureFusion 传入，已优化为 2D)
+            seq_feat: (B, T, D) - 局部序列特征 (B, T, 768)
+            fused_cls: (B, D) - 全局融合特征 (B, 768)
             
         Returns:
-            probs: (B, T) - 边界概率分数
+            tuple: (probs, E_context)
+                probs: (B, T) - 边界概率分数 (P_score)
+                E_context: (B, T, hidden_dim * 2) - 增强的 Bi-LSTM 上下文特征
         """
-        # 0. 扁平化 LSTM 参数以优化性能 (解决 'not part of single contiguous chunk' 警告)
+        # 0. 扁平化 LSTM 参数以优化性能
         self.lstm.flatten_parameters()
-        
         B, T, D = seq_feat.shape
         
         # --- 1. 初始化隐藏状态 (h0, c0) ---
-        
-        # a. 投影 fused_cls: (B, D) -> (B, hidden_dim)
-        # 确保数据类型匹配 (DeepSpeed/FP16 兼容性)
         target_dtype = self.cls_h0_projection.weight.dtype
         if fused_cls.dtype != target_dtype:
-             fused_cls = fused_cls.to(target_dtype)
-             
-        h0_base = self.cls_h0_projection(fused_cls) 
-        c0_base = self.cls_c0_projection(fused_cls)
+            fused_cls = fused_cls.to(target_dtype)
         
-        # b. 扩展状态以匹配 LSTM 期望的形状
-        # 期望形状: [num_layers * num_directions, B, hidden_dim]
-        required_layers = self.num_lstm_layers * self.num_directions
-        
-        h0 = h0_base.unsqueeze(0).repeat(required_layers, 1, 1)
-        c0 = c0_base.unsqueeze(0).repeat(required_layers, 1, 1)
+        h0_base = self.cls_h0_projection(fused_cls)  # (B, 512)
+        c0_base = self.cls_c0_projection(fused_cls)  # (B, 512)
 
-        # --- 2. Bi-LSTM 前向传播 ---
-        # 传入 seq_feat 和初始化状态
-        # lstm_out: (B, T, hidden_dim * 2)
-        lstm_out, _ = self.lstm(seq_feat, (h0, c0))
+        required_layers = self.num_lstm_layers * self.num_directions  # 24
+        h0 = h0_base.unsqueeze(0).repeat(required_layers, 1, 1)  # (24, B, 512)
+        c0 = c0_base.unsqueeze(0).repeat(required_layers, 1, 1)  # (24, B, 512)
+        
+        # --- 2. **增强的前向传播：残差 + LayerNorm** ---
+        
+        # 2.1 计算残差连接的输入投影
+        residual_input = self.residual_proj(seq_feat)  # (B, T, 1024)
+        
+        # 2.2 输入投影（可选，提升表达能力）
+        lstm_input = self.input_proj(seq_feat)  # (B, T, 1024)
+        
+        # 2.3 Bi-LSTM 前向传播
+        lstm_out, _ = self.lstm(lstm_input, (h0, c0))  # (B, T, 1024)
+        
+        # 2.4 **LayerNorm**
+        lstm_normed = self.lstm_norm(lstm_out)  # (B, T, 1024)
+        
+        # 2.5 **残差连接**：LSTM 输出 + 输入投影
+        E_context = lstm_normed + residual_input  # (B, T, 1024)
+        
+        # 2.6 **Dropout**
+        E_context = self.lstm_dropout(E_context)
         
         # --- 3. 生成 Logits 和 概率 ---
-        # logits: (B, T, 1)
-        logits = self.fc(lstm_out)
+        logits = self.fc(E_context)  # (B, T, 1)
+        probs = self.sigmoid(logits).squeeze(-1)  # (B, T)
         
-        # probs: (B, T, 1) -> (B, T)
-        probs = self.sigmoid(logits)
-        
-        return probs.squeeze(-1)
+        return probs, E_context
 
-
+#将 $P_{\text{score}}$ 转化为硬边界 $b_{\text{hard\_ste}}$，同时通过 $b_{\text{soft}}$ 路径保留梯度通道。
 class SCPCBoundaryHardener(nn.Module):
     """
     将软概率转换为硬边界 (0/1)，同时使用 Straight-Through Estimator (STE) 允许梯度回传。
@@ -338,6 +361,121 @@ class SCPCBoundaryHardener(nn.Module):
         # 确保输出是一个单纯的 Tensor
         return b_hard_ste
 
+
+
+
+#增加返回持续时间
+#
+#
+#作用1：韵律感知 (Prosody Awareness)：在语音中，长音（强调）和短音（停顿或快速词汇）承载了极强的语义信息。
+#Mean Pooling 会抹平波形强度，但 duration 找回了时间维度的厚度
+#
+def segment_pooling_with_durations(sequence_features: torch.Tensor, hard_boundaries: torch.Tensor):
+    """
+    全向量化实现：同时返回池化特征和每个段的持续时间（帧数）。
+    
+    Returns:
+        segmented_batch: List[torch.Tensor] - 每个元素 (N_i, D)
+        durations_batch: List[torch.Tensor] - 每个元素 (N_i, 1)
+    """
+    B, T, D = sequence_features.shape
+    device = sequence_features.device
+
+    # --- Step 1: 生成 Segment ID ---
+    shift_boundaries = torch.cat([torch.zeros((B, 1), device=device), hard_boundaries[:, :-1]], dim=1)
+    seg_ids = torch.cumsum(shift_boundaries, dim=1).long() # (B, T)
+
+    # --- Step 2: 准备聚合容器 ---
+    num_segments = seg_ids.max().item() + 1
+    seg_sum = torch.zeros((B, num_segments, D), device=device, dtype=sequence_features.dtype)
+    seg_count = torch.zeros((B, num_segments, 1), device=device, dtype=sequence_features.dtype)
+
+    # --- Step 3: 并行聚合 (Scatter Add) ---
+    seg_ids_expanded = seg_ids.unsqueeze(-1).expand(-1, -1, D)
+    seg_sum.scatter_add_(1, seg_ids_expanded, sequence_features)
+    
+    # 这里的 seg_count 记录了每个 Segment ID 对应的帧数
+    seg_count.scatter_add_(1, seg_ids.unsqueeze(-1), torch.ones((B, T, 1), device=device, dtype=sequence_features.dtype))
+
+    # --- Step 4: 计算平均特征 ---
+    seg_avg = seg_sum / torch.clamp(seg_count, min=1.0)
+
+    # --- Step 5: 截断并打包回 List ---
+    segmented_batch = []
+    durations_batch = []
+    
+    actual_seg_counts = seg_ids.max(dim=1)[0] + 1
+    
+    for b in range(B):
+        n = actual_seg_counts[b].item()
+        
+        # 提取该 sample 真实的特征段
+        segmented_batch.append(seg_avg[b, :n])
+        
+        # 提取该 sample 真实的各段长度 (帧数)
+        # 注意：这里返回的是原始帧数，后续进入 duration_embed 前可以转为 float
+        durations_batch.append(seg_count[b, :n])
+
+    return segmented_batch, durations_batch
+
+
+
+
+#改进快速版本
+def segment_pooling_tensorized(sequence_features: torch.Tensor, hard_boundaries: torch.Tensor):
+    """
+    全向量化实现，无 Python 循环，无 CPU 瓶颈。
+    
+    Args:
+        sequence_features: (B, T, D) - 帧特征 (E_context)
+        hard_boundaries: (B, T) - 0/1 边界信号 (来自 Hardener)
+    Returns:
+        segmented_batch: List[torch.Tensor] - 每个 Tensor 形状为 (N_i, D)
+    """
+    B, T, D = sequence_features.shape
+    device = sequence_features.device
+
+    # --- Step 1: 为每一帧生成唯一的 Segment ID ---
+    # 使用 cumsum 确定每一帧属于第几个段
+    # 我们希望边界点本身属于当前段的结束，或者下一段的开始。
+    # 按照 TICS 逻辑，边界点 i 是段的最后一个元素，所以我们对 boundaries 做 shift
+    # shift_boundaries = [0, b_0, b_1, ..., b_{T-1}]
+    shift_boundaries = torch.cat([torch.zeros((B, 1), device=device), hard_boundaries[:, :-1]], dim=1)
+    seg_ids = torch.cumsum(shift_boundaries, dim=1).long() # (B, T)
+
+    # --- Step 2: 准备聚合容器 ---
+    num_segments = seg_ids.max().item() + 1
+    # 存储特征累加和
+    seg_sum = torch.zeros((B, num_segments, D), device=device, dtype=sequence_features.dtype)
+    # 存储每个段包含的帧数（用于求平均）
+    seg_count = torch.zeros((B, num_segments, 1), device=device, dtype=sequence_features.dtype)
+
+    # --- Step 3: 并行聚合 (Scatter Add) ---
+    # 将 seg_ids 扩展到特征维度 (B, T, D)
+    seg_ids_expanded = seg_ids.unsqueeze(-1).expand(-1, -1, D)
+    
+    # 核心操作：根据 seg_ids 把特征填入对应的段索引中
+    seg_sum.scatter_add_(1, seg_ids_expanded, sequence_features)
+    # 计算每个段有多少帧
+    seg_count.scatter_add_(1, seg_ids.unsqueeze(-1), torch.ones((B, T, 1), device=device, dtype=sequence_features.dtype))
+
+    # --- Step 4: 计算平均特征 ---
+    # 避免除以 0 (有些预留的 seg_id 可能在某些 batch 中没用到)
+    seg_avg = seg_sum / torch.clamp(seg_count, min=1.0)
+
+    # --- Step 5: 转换回 List 结构以匹配后续代码 ---
+    # 因为每个 batch 的段数不同，我们需要根据真实的段数进行截断
+    segmented_batch = []
+    # 计算每个 sample 真实的段数
+    actual_seg_counts = seg_ids.max(dim=1)[0] + 1
+    for b in range(B):
+        n = actual_seg_counts[b].item()
+        segmented_batch.append(seg_avg[b, :n])
+
+    return segmented_batch
+
+
+#原始版本
 def segment_pooling(sequence_features: torch.Tensor, hard_boundaries) -> List[torch.Tensor]:
     """
     Args:
@@ -411,3 +549,79 @@ def segment_pooling(sequence_features: torch.Tensor, hard_boundaries) -> List[to
         segmented_batch.append(torch.stack(segment_vectors, dim=0))
 
     return segmented_batch
+
+
+
+
+
+#(训练时对齐)： 使用 I_true（真值索引）。这通常用于第二阶段，或者作为第一阶段的“锚点”。
+
+def segment_pooling_true(E_frame, I_true, N_seg_max):
+    """
+    基于地面真值索引 I_true 对帧特征 E_frame 进行 Segment Pooling (求平均)。
+    
+    Args:
+        E_frame (torch.Tensor): [B, N_frame, D_feat] - 编码器帧特征
+        I_true (torch.Tensor): [B, N_frame] - 地面真值 Segment 索引 (0, 0, 1, 1, ...)
+        N_seg_max (int): 当前 Batch 中最大的 Segment 数量 (M_max)
+        
+    Returns:
+        E_speech_true (torch.Tensor): [B, N_seg_max, D_feat] - 聚合后的 Segment 特征
+    """
+    B, N_frame, D_feat = E_frame.shape
+    device = E_frame.device
+    
+    # --- 步骤 A: 准备 Aggregation 目标张量 ---
+    # target_shape: [B, N_seg_max, D_feat]
+    target_shape = (B, N_seg_max, D_feat)
+    
+    # 初始化求和张量和计数张量
+    E_sum = torch.zeros(target_shape, dtype=E_frame.dtype, device=device)
+    E_count = torch.zeros(target_shape, dtype=E_frame.dtype, device=device)
+    
+    # --- 步骤 B: 展平张量以便于 Scatter 操作 ---
+    
+    # 展平特征: [B * N_frame, D_feat]
+    E_frame_flat = E_frame.view(-1, D_feat)
+    
+    # 展平索引: [B * N_frame]
+    I_true_flat = I_true.view(-1)
+    
+    # 关键：创建 target index。我们需要将 [B*N_frame] 的 I_true_flat 扩展到 [B*N_frame, D_feat] 
+    # 形状，以便 scatter_add_ 在 D_feat 维度上进行正确的求和。
+    I_true_flat_expanded = I_true_flat.unsqueeze(-1).expand_as(E_frame_flat) # [B*N_frame, D_feat]
+    
+    # --- 步骤 C: 执行 Scatter Add (求和) ---
+    # scatter_add_(dim=0, index, src)
+    # target: [B * N_seg_max, D_feat]
+    E_sum_flat = E_sum.view(B * N_seg_max, D_feat)
+    
+    # 1. 计算总和 (Sum): 将 E_frame_flat 的特征加到 E_sum_flat 的指定位置
+    # 这里需要一个更复杂的 index 来包含 Batch ID 和 Segment ID
+    # 由于 PyTorch 的 scatter 对维度 index 比较严格，这里简化为 Batch 循环或使用 torch_scatter 库
+    # 
+    # 优化方案：使用 for 循环 (更易理解和实现)
+    for b in range(B):
+        # 针对当前 Batch 的帧特征和索引
+        E_frame_b = E_frame[b]  # [N_frame, D_feat]
+        I_true_b = I_true[b]    # [N_frame]
+        
+        # 1. 求和
+        E_sum[b].index_add_(0, I_true_b, E_frame_b) # 将 E_frame_b 按 I_true_b 的索引加到 E_sum[b] 上
+        
+        # 2. 计数
+        # 创建一个全 1 的张量，用于计数
+        ones = torch.ones_like(E_frame_b) 
+        E_count[b].index_add_(0, I_true_b, ones) 
+        
+    # --- 步骤 D: 求平均 (Divide by Count) ---
+    
+    # 避免除以零 (Segment Padding)
+    E_count = E_count.clamp(min=1) 
+    
+    # E_speech_true 即为 E_sum / E_count (元素级除法)
+    E_speech_true = E_sum / E_count
+    
+    return E_speech_true
+
+

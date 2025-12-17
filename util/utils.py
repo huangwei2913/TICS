@@ -264,3 +264,5 @@ def load_large_weights_tolerant(target_model, large_checkpoint_path, start_layer
 #     # 假设 target_model 已经被实例化
 #     # load_xlarge_weights_tolerant(segment_encoder, HUGE_XLARGE_PATH)
 #     pass
+
+

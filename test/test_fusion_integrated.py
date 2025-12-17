@@ -10,7 +10,7 @@ project_root = os.path.join(current_dir, '..')
 sys.path.insert(0, project_root)
 # -----------------------------------------------------
 
-from moco_tics.backbone import FrozenHubertBackbone
+from moco_tics.modules import FrozenHubertBackbone
 from util.utils import CrossAttentionBlock
 
 class FeatureFusion(nn.Module):

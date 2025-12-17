@@ -14,32 +14,35 @@ sys.path.append(project_root)
 # --------------------------------------------------
 
 # 现在就可以正确导入同级目录 moco_tics 下的模块了
-from moco_tics.backbone import FrozenHubertBackbone
+from moco_tics.modules import FrozenHubertBackbone
 from transformers import HubertModel # 确保这个也已经安装
 
 def test():
-    # 创建一个伪造的音频 Batch (Batch=2, Time=16000*2s)
-    # 注意：HubertModel.from_pretrained 默认期望输入是 (Batch, Samples)
-    fake_wav = torch.randn(2, 32000) 
-    
-    # 请确保您已经完成了 conda activate tics 并且安装了所有依赖
+    # 伪造一个 Batch=2、长度=2s(假设 16kHz) 的音频
+    fake_wav = torch.randn(2, 32000)  # (batch, time_samples)
+
     print("Attempting to load HuBERT backbone...")
-    
-    # 调整 output_layer，例如用第 9 层
-    backbone = FrozenHubertBackbone(output_layer=9)
-    
-    # 将输入数据移到 GPU 上
+
+    # 实例化：可以传入自定义 hubert 路径，也可以用默认
+    backbone = FrozenHubertBackbone(
+        model_path="/mnt/facebook/hubert-base-ls960"
+    )
+
+    # 如果有 GPU，就搬到 GPU
     if torch.cuda.is_available():
         fake_wav = fake_wav.cuda()
         backbone = backbone.cuda()
 
-    # 运行前向传播
-    features = backbone(fake_wav)
-    
-    print("--- Test Successful ---")
-    print(f"Output device: {features.device}")
-    # 预期输出: torch.Size([2, 100, 768]) 
-    print(f"Output shape: {features.shape}") 
+    # 举例：提取 embedding(0)、第 6 层和第 12 层
+    layers_to_extract = [0, 6, 12]
 
+    # 前向传播
+    features_list = backbone(fake_wav, layers_to_extract=layers_to_extract)
+
+    print("--- Test Successful ---")
+    for idx, feat in zip(layers_to_extract, features_list):
+        print(f"Layer {idx} -> shape: {feat.shape}, device: {feat.device}")
+    # 比如预期: torch.Size([2, T, 768])，T 大约是帧数
+    
 if __name__ == "__main__":
     test()
