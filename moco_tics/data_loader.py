@@ -9,6 +9,9 @@ from typing import List, Tuple, Dict
 import pandas as pd
 import os
 import json
+from .TicsAugmentation import TicsAugmentation
+
+
 
 class BoundaryLabelGenerator:
     def __init__(self, fps=50):
@@ -43,89 +46,102 @@ class BoundaryLabelGenerator:
             return torch.zeros(target_frames, dtype=torch.float32)
 
 class TICSDataset(Dataset):
-    def __init__(self, csv_path: str, sample_rate: int = 16000, xlmr_path="/mnt/facebook/xlm-roberta-large", stage=1):
-        """
-        csv_path: 第一列 wav 路径, 第二列 json 路径
-        """
+    def __init__(self, csv_path: str, sample_rate: int = 16000, xlmr_path="/mnt/facebook/xlm-roberta-large", augmentor=None, stage=1):
         self.stage = stage
-        self.tokenizer = XLMRobertaTokenizer.from_pretrained(xlmr_path)
-        df = pd.read_csv(csv_path, header=None) # 假设没有表头，或者您指定 header=0
-        self.audio_files = df.iloc[:, 0].tolist()
-        self.json_files = df.iloc[:, 1].tolist()
-        
         self.sample_rate = sample_rate
+        
+        # 1. 更加健壮的 CSV 加载
+        print(f"🔍 正在加载 CSV 文件: {csv_path}")
+        # 如果你的 CSV 确实没有表头，用 header=None；如果有，用 header=0
+        df = pd.read_csv(csv_path, header=None) 
+        
+        # 2. 核心：过滤掉非路径的无效行（比如表头文字）
+        # 只有当第一列包含 '/' (路径特征) 且不为空时才保留
+        valid_mask = df.iloc[:, 0].str.contains('/', na=False)
+        df = df[valid_mask]
+        
+        self.audio_files = df.iloc[:, 0].tolist()
+        self.json_files = df.iloc[:, 1].tolist() 
+        print(f"✅ 数据集加载完成，有效条数: {len(self.audio_files)}")
+
+        # 组件初始化
+        self.tokenizer = XLMRobertaTokenizer.from_pretrained(xlmr_path)
+        self.augmentor = augmentor if augmentor else TicsAugmentation(mode='none')
         self.label_gen = BoundaryLabelGenerator(fps=50)
 
     def __len__(self):
         return len(self.audio_files)
 
-    def _apply_augmentation(self, waveform: torch.Tensor, is_view2: bool) -> torch.Tensor:
-        # View 1: 原始/简单增益
-        # View 2: 时间反转 + 增益
-        # 注意：此处只做非变速增强，确保时间轴一致
-        aug_wav = waveform.clone()
-        if is_view2:
-            aug_wav = torch.flip(aug_wav, dims=[1])
-            
-        gain = random.uniform(0.8, 1.2)
-        aug_wav = aug_wav * gain
-        return torch.clamp(aug_wav, -1.0, 1.0)
-
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        audio_path = self.audio_files[idx]
-        json_path = self.json_files[idx]
+        try:
+            #print(f"DEBUG: [Rank {torch.distributed.get_rank()}] Loading Index: {idx}")
+            audio_path = self.audio_files[idx]
+            json_path = self.json_files[idx]
 
+            # --- 关键调试点：如果还是报错，这里会打印出具体的路径内容 ---
+            if not os.path.exists(json_path):
+                # 针对 400 万数据：跳过损坏样本，递归取下一个
+                print(f"⚠️ 找不到 JSON.......: {json_path}，尝试下一条...")
+                return self.__getitem__((idx + 1) % len(self))
 
-        with open(json_path, 'r') as f:
-            meta = json.load(f)
+            # 1. 加载元数据
+            with open(json_path, 'r') as f:
+                meta = json.load(f)
 
-        # 1. 加载音频
-        waveform, sr = torchaudio.load(audio_path)
-        
-        # 强制单声道
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+            # 2. 加载音频
+            if not os.path.exists(audio_path):
+                return self.__getitem__((idx + 1) % len(self))
+                
+            waveform, sr = torchaudio.load(audio_path)
             
-        # 2. 计算 HuBERT 预期的特征帧数
-        # HuBERT Stride 是 320 (20ms)，所以 T = L // 320
-        target_T = waveform.shape[1] // 320
-        
-        if target_T == 0: # 过滤极短音频
-            return self.__getitem__((idx + 1) % len(self))
+            # 重采样处理 (如果磁盘文件不是 16k)
+            if sr != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
+                waveform = resampler(waveform)
 
-        # 3. 生成 Y_true
-        y_true = self.label_gen.generate(json_path, target_T)
+            # 强制单声道
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+                
+            # 3. 计算 HuBERT 帧数并过滤超短音频
+            target_T = waveform.shape[1] // 320
+            if target_T <= 1: 
+                return self.__getitem__((idx + 1) % len(self))
 
-        # 4. 生成两个增强视图
-        view1 = self._apply_augmentation(waveform, is_view2=False)
-        view2 = self._apply_augmentation(waveform, is_view2=True)
+            # 4. 生成标签 (传入 json_path 或 meta，取决于你 Generator 的实现)
+            y_true = self.label_gen.generate(json_path, target_T)
 
-        if self.stage == 2:
-            # 4. 文本 Token 处理 (Stage 2 专属)
-            text = meta['text']
-            # 对文本进行编码
-            encoded_text = self.tokenizer(
-                text,
-                padding='max_length',
-                truncation=True,
-                max_length=128,  # 根据你的平均句长调整
-                return_tensors='pt'
-            )
-            
+            # 5. 生成增强视图
+            view1 = self.augmentor(waveform, is_view2=False)
+            view2 = self.augmentor(waveform, is_view2=True)
+
+            if self.stage == 2:
+                text = meta.get('text', "")
+                encoded_text = self.tokenizer(
+                    text,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=128,
+                    return_tensors='pt'
+                )
+                return {
+                    "view1": view1.squeeze(0),
+                    "y_true": y_true,
+                    "text_ids": encoded_text['input_ids'].squeeze(0),
+                    "text_mask": encoded_text['attention_mask'].squeeze(0)
+                }
+
             return {
-                "view1": view1, # 语音张量
-                "y_true": y_true, # 边界标签
-                "text_ids": encoded_text['input_ids'].squeeze(0),
-                "text_mask": encoded_text['attention_mask'].squeeze(0)
+                "view1": view1.squeeze(0),
+                "view2": view2.squeeze(0),
+                "y_true": y_true
             }
 
-
-        return {
-            "view1": view1.squeeze(0),
-            "view2": view2.squeeze(0),
-            "y_true": y_true
-        }
-
+        except Exception as e:
+            # 万能捕获，确保 400 万训练不会因为某一个 json 格式错误而中断
+            # print(f"❌ 索引 {idx} 加载崩溃: {str(e)}")
+            return self.__getitem__((idx + 1) % len(self))
+        
 
 def tics_collate_fn(batch):
     """

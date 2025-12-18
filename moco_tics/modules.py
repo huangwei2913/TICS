@@ -18,33 +18,27 @@ sg = StopGradient.apply
 
 # --- 2. Backbone ---
 class FrozenHubertBackbone(nn.Module):
-    # output_layer 现在用于单层模式（兼容旧代码），layers_to_extract 用于多层模式
     def __init__(self, model_path: str = None): 
         super().__init__()
         
         # 定义本地路径
-        if model_path is None:
-            local_path = "/mnt/facebook/hubert-base-ls960" 
-        else:
-            local_path = model_path
+        local_path = model_path if model_path is not None else "/mnt/facebook/hubert-base-ls960" 
             
         print(f"Loading Backbone from local path: {local_path}...")
 
-        # from_pretrained 会自动识别本地文件夹
-        # **注意：** 确保 HuggingFace Transformer 库版本较新，可以处理 output_hidden_states=True
+        # 加载预训练模型
         self.model = HubertModel.from_pretrained(local_path)
         
-        # 核心操作：冻结所有参数
+        # 冻结所有参数
         for param in self.model.parameters():
             param.requires_grad = False
             
     def forward(self, wav_input: torch.Tensor, 
                 layers_to_extract: List[int] = None, 
-                attention_mask: torch.Tensor = None) -> List[torch.Tensor]:
+                attention_mask: torch.Tensor = None) -> Dict[int, torch.Tensor]:
         
-        # wav_input: (Batch, Time_samples)
-        
-        # 如果没有指定层，则默认提取最后一层（例如 Layer 12）
+        #print(f"layers_to_extract: {layers_to_extract}...")
+        # 如果没有指定层，则默认提取最后一层
         if layers_to_extract is None:
              layers_to_extract = [12] 
         
@@ -55,20 +49,22 @@ class FrozenHubertBackbone(nn.Module):
                 output_hidden_states=True
             )
             
-            # hidden_states 是一个 tuple，包含 (embedding, layer_1, ..., layer_12)
-            # 所以 Layer N 对应 outputs.hidden_states[N]
+            # hidden_states (embedding, layer_1, ..., layer_12)
             hidden_states = outputs.hidden_states 
             
-            # 提取所需的特征并放入字典
-            features_dict: Dict[int, torch.Tensor] = {}
+            features_dict: Dict[str, torch.Tensor] = {} # 改为 str
             for layer_idx in layers_to_extract:
                 if 0 <= layer_idx < len(hidden_states):
-                    # 提取特定层 (Batch, Frames, 768)
-                    features_dict[layer_idx] = hidden_states[layer_idx]
+                    # 将层号转换为字符串，避开 DeepSpeed 的 Key 类型检查
+                    features_dict[str(layer_idx)] = hidden_states[layer_idx]
                 else:
-                    raise IndexError(f"Layer index {layer_idx} out of range (0 to {len(hidden_states) - 1})")
+                    raise IndexError(f"Layer index {layer_idx} out of range")
+
+        #print(f"features_dicts..................: {features_dict}...") 
+
+        return features_dict
                     
-        return [features_dict[i] for i in layers_to_extract]
+
     
 
 class SequenceAttentionBlock(nn.Module):
@@ -103,100 +99,70 @@ class SequenceAttentionBlock(nn.Module):
 class FeatureFusion(nn.Module):
     def __init__(self, dim, layers_to_use: list, num_heads=8):
         super().__init__()
-        self.layers_to_use = layers_to_use
-        self.dim = dim # 768
+        self.layers_to_use = layers_to_use # 这里通常是 [2, 5, 9] 这样的 int 列表
+        self.dim = dim
         num_layers = len(layers_to_use)
-
-        # 1. 序列特征融合：可学习的加权求和
-        # w: (num_layers) 学习每层序列特征的权重
         self.sequence_weights = nn.Parameter(torch.ones(num_layers, dtype=torch.float32))
-        self.norm_sequence = nn.LayerNorm(dim) # 融合后的序列特征做 LayerNorm
-
-        # 2. CLS Token 提取
-        # 为每个选定的层创建一个 CrossAttentionBlock 来提取其 CLS Token
+        self.norm_sequence = nn.LayerNorm(dim)
         self.attention_blocks = nn.ModuleList([
             CrossAttentionBlock(dim, num_heads=num_heads)
             for _ in layers_to_use
         ])
-        
-        # 3. CLS Token 融合：使用自注意力机制
-        # 一个或多个 Transformer Block，用于融合 L_num 个 CLS Tokens
         self.cls_fusion_block = SequenceAttentionBlock(dim, num_heads) 
-        
-        # 4. 融合后的 CLS Token 降维层 (可选，如果维度不变，可以不用)
-        # 这里仅使用 LayerNorm 来规范化最终的 CLS Token
         self.norm_cls = nn.LayerNorm(dim)
 
-    def forward(self, features_dict: Dict[int, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            features_dict: {层索引: (B, T, C) 张量}
-        Returns:
-            fused_sequence_features (B, T, C)
-            fused_cls_token (B, C) <- 修正为 2D，因为 TICSBoundaryStudent 会 unsqueeze
-        """
-        batch_size = next(iter(features_dict.values())).shape[0]
-        time_len = next(iter(features_dict.values())).shape[1]
+    def forward(self, features_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. 获取基础维度信息 (使用 .values() 不受 Key 类型影响)
+        first_tensor = next(iter(features_dict.values()))
+        batch_size = first_tensor.shape[0]
+        time_len = first_tensor.shape[1]
         
-        # 确保 CLS Token 模板的设备和 dtype 与权重一致
         device = self.sequence_weights.device
-        dtype = self.norm_sequence.weight.dtype # 使用模型权重精度 (通常是 FP16)
+        dtype = self.norm_sequence.weight.dtype
         
+        # 2. 准备容器
         cls_token_template = torch.zeros(batch_size, 1, self.dim, device=device, dtype=dtype)
-        
         all_cls_tokens = []
         all_sequence_features = []
-
-        # 1. 提取 CLS Tokens 和收集序列特征
+        
+        # 3. 核心修改点：遍历并使用 str(layer_idx) 索引
         for i, layer_idx in enumerate(self.layers_to_use):
-            sequence_features = features_dict[layer_idx] # (B, T, C)
+            # 将 int 类型的 layer_idx 转为字符串，以匹配 Backbone 返回的 Dict Key
+            str_key = str(layer_idx)
             
-            # 将序列特征转换为融合所需的精度 (FP16/FP32)
+            if str_key not in features_dict:
+                raise KeyError(f"Layer {str_key} not found in features_dict. Available: {list(features_dict.keys())}")
+            
+            sequence_features = features_dict[str_key]
+            
+            # 确保精度一致 (DeepSpeed 开启 fp16 时非常重要)
             if sequence_features.dtype != dtype:
                  sequence_features = sequence_features.to(dtype)
             
             all_sequence_features.append(sequence_features)
             
-            # 拼接: [CLS_token; Sequence_Features] -> (B, T+1, C)
-            x_with_cls = torch.cat([cls_token_template.to(sequence_features.dtype), sequence_features], dim=1)
-            
-            # 运行 CrossAttentionBlock，提取新的 CLS Token (B, 1, C)
+            # Cross-Attention 融合
+            x_with_cls = torch.cat([cls_token_template, sequence_features], dim=1)
             new_cls_token = self.attention_blocks[i](x_with_cls)
-            all_cls_tokens.append(new_cls_token.squeeze(1)) # (B, C)
-
-        # --- 第一项改进：融合序列特征 ---
-        
-        # 堆叠序列特征: List[(B, T, C)] -> (L_num, B, T, C)
+            all_cls_tokens.append(new_cls_token.squeeze(1)) # 取出更新后的 CLS
+            
+        # 4. 序列特征加权融合 (Weighted Average)
         stacked_sequences = torch.stack(all_sequence_features, dim=0) 
+        normalized_weights = torch.softmax(self.sequence_weights, dim=0)
         
-        # 可学习的加权求和
-        # 确保权重求和为 1，使用 softmax 实现归一化
-        normalized_weights = torch.softmax(self.sequence_weights, dim=0) # (L_num)
+        # 修正广播机制权重相乘
+        weighted_sum = (normalized_weights.view(-1, 1, 1, 1) * stacked_sequences).sum(dim=0)
+        fused_sequence_features = self.norm_sequence(weighted_sum)
         
-        # 广播权重并加权求和: (L_num) * (L_num, B, T, C) -> (B, T, C)
-        # unsqueeze 维度使其与 stacked_sequences 对齐: (L_num, 1, 1, 1)
-        weighted_sum = (normalized_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * stacked_sequences).sum(dim=0)
+        # 5. CLS Token 融合 (Sequence Attention)
+        stacked_cls_tokens = torch.stack(all_cls_tokens, dim=1) # (B, num_layers, dim)
+        fused_cls_tokens = self.cls_fusion_block(stacked_cls_tokens)
         
-        fused_sequence_features = self.norm_sequence(weighted_sum) # (B, T, C)
-
-        # --- 第二项改进：融合 CLS Tokens ---
+        # 取出融合后的第一个位置作为 final CLS
+        final_cls_token = fused_cls_tokens[:, 0]
+        fused_cls_token = self.norm_cls(final_cls_token)
         
-        # 堆叠 CLS Tokens: List[(B, C)] -> (B, L_num, C)
-        stacked_cls_tokens = torch.stack(all_cls_tokens, dim=1)
-        
-        # 使用 SequenceAttentionBlock 进行融合
-        fused_cls_tokens = self.cls_fusion_block(stacked_cls_tokens) # (B, L_num, C)
-        
-        # 取融合后的序列的第一个 token 作为最终的全局特征 (类似 Transformer 的 CLS Token 策略)
-        final_cls_token = fused_cls_tokens[:, 0] # (B, C)
-        
-        # 规范化并返回
-        fused_cls_token = self.norm_cls(final_cls_token) # (B, C)
-        
-        # 返回: 融合序列特征 (B, T, C) 和 融合 CLS Token (B, C)
-        # 注意: 按照 TICSBoundaryStudent 的最新实现，我们返回 2D (B, C)
         return fused_sequence_features, fused_cls_token
-
     
 
 import torch
@@ -204,119 +170,105 @@ import torch.nn as nn
 
 class TICSBoundaryStudent(nn.Module):
     """
-    TICS Student 边界预测网络（增强版）：
-    1. 使用局部序列特征 (seq_feat) 作为 Bi-LSTM 的输入。
-    2. 使用全局融合特征 (fused_cls) 来初始化 Bi-LSTM 的初始隐藏状态 (h0, c0)。
-    3. **新增：残差连接 + LayerNorm**，提升深层训练稳定性。
-    4. Bi-LSTM 捕获上下文后，通过 FC 层映射到边界概率。
+    TICS Student 边界预测网络（优化版）：
+    1. LSTM 直接处理 HuBERT 的 768 维原始特征，避免投影导致的特征损失。
+    2. residual_proj 仅作为支路，将 768 映射到 1024 以匹配双向 LSTM 的输出维度。
+    3. 采用 Pre-activation 思想的残差连接 + LayerNorm。
     """
     def __init__(self, input_dim=768, hidden_dim=512, dropout=0.1, num_lstm_layers=12):
-        """
-        Args:
-            input_dim (int): 序列特征 (seq_feat) 和全局特征 (fused_cls) 的维度 (如 HuBERT 的 768)。
-            hidden_dim (int): LSTM 隐藏状态的维度 (512，提升容量)。
-            dropout (float): LSTM 层间 Dropout 率。
-            num_lstm_layers (int): LSTM 的层数 (12，提升容量)。
-        """
         super().__init__()
         
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim          # 768
+        self.hidden_dim = hidden_dim        # 512
         self.num_lstm_layers = num_lstm_layers
-        self.num_directions = 2  # 双向 LSTM
+        self.num_directions = 2             # 双向
         self.output_dim = hidden_dim * self.num_directions  # 1024
         
-        # 1. Bi-LSTM 网络（增强容量）
+        # 1. Bi-LSTM：输入直接对齐 HuBERT (768)
         self.lstm = nn.LSTM(
-            input_size=input_dim,          # 768
-            hidden_size=hidden_dim,        # 512
-            num_layers=num_lstm_layers,    # 12
+            input_size=input_dim,           # 修改回 768
+            hidden_size=hidden_dim,         # 512
+            num_layers=num_lstm_layers,     # 12
             batch_first=True, 
             bidirectional=True, 
-            dropout=dropout
+            dropout=dropout if num_lstm_layers > 1 else 0
         )
         
-        # 2. **新增：输入投影层（维度适配残差连接）**
-        # seq_feat (B,T,768) -> lstm_input (B,T,1024)，为残差做准备
-        self.input_proj = nn.Linear(input_dim, self.output_dim)
-        
-        # 3. **新增：LayerNorm（LSTM 输出后归一化）**
-        self.lstm_norm = nn.LayerNorm(self.output_dim)
-        
-        # 4. **新增：残差投影层（输入维度适配）**
-        # 将输入投影到输出维度，用于残差连接
+        # 2. 残差投影层：仅用于将输入 768 升维到 1024，以便与 LSTM 输出相加
         self.residual_proj = nn.Linear(input_dim, self.output_dim)
         
-        # 5. **新增：Post-LSTM Dropout**
+        # 3. 归一化与 Dropout
+        self.lstm_norm = nn.LayerNorm(self.output_dim)
         self.lstm_dropout = nn.Dropout(dropout)
         
-        # 6. 初始状态投影层 (用于状态初始化)
+        # 4. 初始状态投影层 (用于将 768 维 fused_cls 转为 LSTM 的 hidden 状态)
         self.cls_h0_projection = nn.Linear(input_dim, hidden_dim)
         self.cls_c0_projection = nn.Linear(input_dim, hidden_dim)
         
-        # 7. 预测头 (FC 层)
+        # 5. 预测头 (FC 层)
         self.fc = nn.Sequential(
             nn.Linear(self.output_dim, self.output_dim // 2),  # 1024 -> 512
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(self.output_dim // 2, 1)  # 512 -> 1
+            nn.Linear(self.output_dim // 2, 1)                  # 512 -> 1
         )
         
-        # 8. 激活函数
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, seq_feat: torch.Tensor, fused_cls: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, seq_feat: torch.Tensor, fused_cls: torch.Tensor):
         """
-        Args:
-            seq_feat: (B, T, D) - 局部序列特征 (B, T, 768)
-            fused_cls: (B, D) - 全局融合特征 (B, 768)
-            
-        Returns:
-            tuple: (probs, E_context)
-                probs: (B, T) - 边界概率分数 (P_score)
-                E_context: (B, T, hidden_dim * 2) - 增强的 Bi-LSTM 上下文特征
+        seq_feat: (B, T, 768)
+        fused_cls: (B, 768)
         """
-        # 0. 扁平化 LSTM 参数以优化性能
         self.lstm.flatten_parameters()
         B, T, D = seq_feat.shape
+        device = seq_feat.device
         
         # --- 1. 初始化隐藏状态 (h0, c0) ---
         target_dtype = self.cls_h0_projection.weight.dtype
-        if fused_cls.dtype != target_dtype:
-            fused_cls = fused_cls.to(target_dtype)
+        fused_cls = fused_cls.to(target_dtype)
         
         h0_base = self.cls_h0_projection(fused_cls)  # (B, 512)
         c0_base = self.cls_c0_projection(fused_cls)  # (B, 512)
 
-        required_layers = self.num_lstm_layers * self.num_directions  # 24
+        required_layers = self.num_lstm_layers * self.num_directions # 24
         h0 = h0_base.unsqueeze(0).repeat(required_layers, 1, 1)  # (24, B, 512)
         c0 = c0_base.unsqueeze(0).repeat(required_layers, 1, 1)  # (24, B, 512)
         
-        # --- 2. **增强的前向传播：残差 + LayerNorm** ---
+        # --- 2. 前向传播：LSTM 主路 + 投影残差支路 ---
         
-        # 2.1 计算残差连接的输入投影
-        residual_input = self.residual_proj(seq_feat)  # (B, T, 1024)
+        # 2.1 支路：对齐维度 (768 -> 1024)
+        residual = self.residual_proj(seq_feat)      # (B, T, 1024)
         
-        # 2.2 输入投影（可选，提升表达能力）
-        lstm_input = self.input_proj(seq_feat)  # (B, T, 1024)
+        # 2.2 主路：LSTM 直接处理原始 768 维特征
+        # 注意：这里不再需要 input_proj
+        lstm_out, _ = self.lstm(seq_feat, (h0, c0))  # (B, T, 1024)
         
-        # 2.3 Bi-LSTM 前向传播
-        lstm_out, _ = self.lstm(lstm_input, (h0, c0))  # (B, T, 1024)
-        
-        # 2.4 **LayerNorm**
-        lstm_normed = self.lstm_norm(lstm_out)  # (B, T, 1024)
-        
-        # 2.5 **残差连接**：LSTM 输出 + 输入投影
-        E_context = lstm_normed + residual_input  # (B, T, 1024)
-        
-        # 2.6 **Dropout**
+        # 2.3 残差融合 + 归一化
+        # 将 LSTM 的建模结果与原始输入的映射相加
+        E_context = self.lstm_norm(lstm_out + residual)
         E_context = self.lstm_dropout(E_context)
         
-        # --- 3. 生成 Logits 和 概率 ---
-        logits = self.fc(E_context)  # (B, T, 1)
-        probs = self.sigmoid(logits).squeeze(-1)  # (B, T)
-        
+        # --- 3. 输出 ---
+        logits = self.fc(E_context)                  # (B, T, 1)
+        probs = self.sigmoid(logits).squeeze(-1)     # (B, T)
+        #用长短期记忆网络（Bi-LSTM）去‘理解’整段语音的起承转合，最后由全连接层（FC）在每一帧做‘是非题’。
         return probs, E_context
+
+#1. 它是如何做“是非题”的？（FC + Sigmoid）在每一帧（时间步 $t$），Bi-LSTM 都会输出一个 1024 维的向量。这个向量里包含了“过去”和“未来”对当前时刻的影响。
+# FC 层 (1024 → 512 → 1)：就像是一个过滤器。它在 1024 个特征中寻找那些“能量突变”、“语速放缓”、“基频下降”等信号。
+# Sigmoid 函数：将 FC 的输出压缩到 $0$ 到 $1$ 之间。输出 0.9：模型非常有信心这里是一个边界（比如一句话结束了）。
+# 输出 0.1：模型认为这里还在发音中，不能切分。2. 为什么需要输出这个“边界概率”？
+# 在 MoCo 架构中，这个概率 $P_{score}$ 有两个至关重要的用途：监督学习 (Supervised Loss)：
+# 你会拿这个 $P_{score}$ 和真实的标签（CSV 里的标注）做二元交叉熵损失（BCE Loss）。
+# 这迫使 Student 网络学会精准定位语音的停顿点。软切分 (Soft Segmentation)：这是最关键的设计逻辑！
+# $P_{score}$ 越高的地方，意味着这里越倾向于是一个 Segment 的终点。这些概率将指导后续如何把 HuBERT 的长序列切分成一个个小块（Segments）
+# ，送入后面的 Encoder。3. 为什么这个设计是“聪明”的？如果只用简单的卷积或线性层，模型只能看到“局部”。但语音的边界是需要上下文的：Bi-LSTM 的作用：
+# 它能看到当前时刻之前和之后的信息。比如：模型发现后面有很长时间的静音（通过向后看），同时发现前面刚结束一个完整的单词（通过向前看），那么它在当前位置输出 $P_{score}=0.98$ 的逻辑就非常稳固。4. 逻辑复盘：特征与概率的“双重产出”注意你的 return 语句：Pythonreturn probs, E_context
+#probs (B, T)：是“是非题”的结果，用于算边界 Loss 和指导切分。E_context (B, T, 1024)：
+# 是“心路历程”，它不仅仅是概率，还包含了丰富的上下文表征。它会被送入 Encoder，作为 MoCo 对比学习的基础。
+
+
 
 #将 $P_{\text{score}}$ 转化为硬边界 $b_{\text{hard\_ste}}$，同时通过 $b_{\text{soft}}$ 路径保留梯度通道。
 class SCPCBoundaryHardener(nn.Module):

@@ -6,42 +6,37 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from moco_tics.model import TICS_MoCo
 from moco_tics.data_loader import TICSDataset, tics_collate_fn
-# 假设您的项目中有这些工具类
+from tqdm import tqdm
+import os
+from moco_tics.TicsAugmentation import TicsAugmentation
 
-
+# 确保 Y_true 和 P_score 的长度对齐
 class BoundaryLoss(nn.Module):
     def __init__(self, pos_weight=15.0):
         super().__init__()
-        # 边界通常是极少数点，使用 pos_weight 缓解正负样本不平衡
         self.pos_weight = pos_weight
 
     def forward(self, P_score, Y_true, mask=None):
-        """
-        P_score: (B, T)
-        Y_true: (B, T)
-        mask: (B, T) 1.0 为真实语音，0.0 为 Padding
-        """
-        # 对齐长度
+        # 确保时间步对齐
         min_t = min(P_score.size(1), Y_true.size(1))
         P_score = P_score[:, :min_t]
         Y_true = Y_true[:, :min_t].float()
-        
-        # 计算加权 BCE
-        # pos_weight > 1 强制模型关注那些稀疏的 '1' (边界点)
+        Y_true = Y_true.to(P_score.dtype)
+        if mask is not None:
+            mask = mask.to(P_score.dtype)
+        # BCE 损失
         loss = F.binary_cross_entropy(P_score, Y_true, reduction='none')
         
+        # 类别不平衡处理 (边界点非常稀疏，所以 pos_weight 设为 15)
         if self.pos_weight != 1.0:
             weight = 1.0 + Y_true * (self.pos_weight - 1.0)
             loss = loss * weight
-
+            
+        # 掩码处理：只计算音频实际长度部分的损失
         if mask is not None:
             mask = mask[:, :min_t].float()
-            loss = (loss * mask).sum() / (mask.sum() + 1e-6)
-        else:
-            loss = loss.mean()
-            
-        return loss
-
+            return (loss * mask).sum() / (mask.sum() + 1e-6)
+        return loss.mean()
 
 class TICSContrastiveLoss(nn.Module):
     def __init__(self, temperature=0.1):
@@ -49,22 +44,33 @@ class TICSContrastiveLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, outputs):
-        # 这里的 q1, k2 形状是 (S_max, B, D)
-        loss_a = self._compute_batch_loss(outputs['q1'], outputs['k2'])
-        loss_b = self._compute_batch_loss(outputs['q2'], outputs['k1'])
+        # 计算 q1->k2 和 q2->k1 的对称损失
+        loss_a = self._compute_segment_loss(outputs['q1'], outputs['k2'], outputs['mask1'])
+        loss_b = self._compute_segment_loss(outputs['q2'], outputs['k1'], outputs['mask2'])
         return (loss_a + loss_b) / 2
 
-    def _compute_batch_loss(self, q, k):
-        # 1. 均值池化，将 (S_max, B, D) 转换为 (B, D) 的句子级别表征
-        # 注意：这里推荐先做均值池化再做对比，这在 MoCo 中更稳定
-        # 如果你想做 Segment-level 对比，需要极其复杂的对齐，Stage I 建议做 Sequence-level
-        q_avg = q.mean(dim=0) # (B, D)
-        k_avg = k.mean(dim=0) # (B, D)
+    def _compute_segment_loss(self, q, k, mask):
+        """
+        q, k: (S, B, D)
+        mask: (B, S) -> True 表示是 padding
+        """
+        # 1. 转换维度为 (B, S, D) 方便与 mask 对应
+        q = q.transpose(0, 1) 
+        k = k.transpose(0, 1)
         
-        # 2. 计算余弦相似度矩阵
-        logits = torch.matmul(q_avg, k_avg.T) / self.temperature # (B, B)
+        # 2. 我们使用 Mean Pooling 得到句子级表示进行对比 (Stage 1 推荐做法)
+        # 或者如果你想做更细粒度的片段对比，可以使用 mask 过滤
+        # 这里采用带 Mask 的平均池化，比单纯的 .mean(dim=0) 更准确
+        fill_mask = mask.unsqueeze(-1).expand_as(q) # (B, S, D)
+        q_masked = q.clone().masked_fill(fill_mask, 0.0)
+        k_masked = k.clone().masked_fill(fill_mask, 0.0)
         
-        # 3. 对角线是正样本
+        valid_counts = (~mask).sum(dim=1, keepdim=True).clamp(min=1) # 每个 batch 有多少有效片段
+        q_avg = q_masked.sum(dim=1) / valid_counts
+        k_avg = k_masked.sum(dim=1) / valid_counts
+        
+        # 3. 标准 MoCo 对比计算 (针对 Batch)
+        logits = torch.matmul(q_avg, k_avg.T) / self.temperature
         labels = torch.arange(q_avg.shape[0], device=q.device)
         return F.cross_entropy(logits, labels)
 
@@ -76,35 +82,48 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lambda_sup', type=float, default=1.0)
     parser.add_argument('--lambda_moco', type=float, default=0.5)
+    parser.add_argument('--aug_mode', type=str, default="baseline")
     parser = deepspeed.add_config_arguments(parser)
     return parser.parse_args()
 
 def main():
     args = parse_args()
-
-    # 1. 模型初始化
-    # 注意：TEACHER_CONFIG 需匹配你 EnhancedSegmentEncoder 的初始化参数
-    TEACHER_CONFIG = {
-        'input_dim': 768,       # HuBERT base 输出维度
-        'segment_dim': 1024,    # 我们要加载 XLarge 权重，所以这里是 1024
-        'num_layers': 12,
-        'dropout': 0.1
-    }
     
+    # 1. 路径与配置准备
+    checkpoint_dir = "checkpoints_stage1"
+    best_model_dir = os.path.join(checkpoint_dir, "best")
+    if args.local_rank <= 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    TEACHER_CONFIG = {
+        'input_dim': 768, 
+        'segment_dim': 1024, 
+        'num_layers': 12,
+    }
+
+    augmentor = TicsAugmentation(mode=args.aug_mode)
+
+    # 2. 模型初始化
+    # TICS_MoCo 内部会自动处理 encoder_k 的初始化和 load_pretrained_weights
     model = TICS_MoCo(
         backbone_path="/mnt/facebook/hubert-base-ls960", 
         teacher_config=TEACHER_CONFIG
     )
-    
-    # ⚠️ 关键步骤：加载 HuBERT XLarge 权重到我们的 RoPE Encoder 中
-    # 假设你的 TICS_MoCo 类中已经集成了这个方法
-    model.encoder_q.load_xlarge_weights("/mnt/facebook/hubert-xlarge-ls960-ft")
-    model.encoder_k.load_xlarge_weights("/mnt/facebook/hubert-xlarge-ls960-ft")
 
-    # 2. 数据加载
-    train_dataset = TICSDataset(csv_path=args.csv_path)
+    # 3. 数据准备
+    train_dataset = TICSDataset(csv_path=args.csv_path, augmentor=augmentor, stage=1)
+
+    #print("✅ 数据集创建完成，长度:", len(train_dataset))
+    #test_loader = DataLoader(train_dataset, batch_size=1, collate_fn=tics_collate_fn, num_workers=0)
+    #test_batch = next(iter(test_loader))
+    #print("✅ 单batch加载成功！Keys:", list(test_batch.keys()))
+    #print("view1 shape:", test_batch["view1"].shape if "view1" in test_batch else "无view1")
+    #del test_loader, test_batch
+    #print("✅ 数据集测试通过")
+    # ===== 结束添加 =====
     
-    # 3. DeepSpeed 初始化
+    # 4. DeepSpeed 初始化
+    # model_engine 处理分布式训练、FP16 混合精度和优化器更新
     model_engine, optimizer, trainloader, _ = deepspeed.initialize(
         args=args,
         model=model,
@@ -113,50 +132,88 @@ def main():
         collate_fn=tics_collate_fn,
     )
 
-    # 4. 损失函数定义
-    # 使用我们优化后的向量化版本
+    # 5. 损失函数定义
     contrastive_criterion = TICSContrastiveLoss(temperature=0.1).to(model_engine.device)
     boundary_criterion = BoundaryLoss(pos_weight=15.0).to(model_engine.device)
 
-    model_engine.train()
+    # 6. 训练监控变量
+    best_loss = float('inf')
+    
+    # --- 训练循环 ---
     for epoch in range(args.epochs):
-        for step, batch in enumerate(trainloader):
-            # 将数据移动到 GPU 并根据需要转半精度
+        model_engine.train()
+        epoch_moco_loss = 0.0
+        epoch_sup_loss = 0.0
+        epoch_total_loss = 0.0
+        
+        # 使用 tqdm 在主进程显示进度
+        pbar = tqdm(trainloader, desc=f"Epoch {epoch}", disable=(args.local_rank > 0))
+        
+        for step, batch in enumerate(pbar):
+            # 获取数据并转换为模型所需的半精度
             view1 = batch["view1"].to(model_engine.device).half()
             view2 = batch["view2"].to(model_engine.device).half()
             y_true = batch["y_true"].to(model_engine.device)
-            # 音频掩码用于 Boundary Loss (B, T)
-            # 假设 tics_collate_fn 返回了有效长度信息
             y_mask = batch.get("y_mask", torch.ones_like(y_true)).to(model_engine.device)
 
-            # --- 前向传播 ---
-            # 接收包含 z, p_score, mask 等的字典
+            # --- Forward ---
             outputs = model_engine(view1, view2)
 
-            # --- 计算损失 ---
-            # 1. 边界监督损失 (使用 View 1 的预测概率)
+            # --- Loss 计算 ---
+            # 1. 边界发现损失 (监督学习)
             loss_sup = boundary_criterion(outputs["P_score"], y_true, mask=y_mask)
-
-            # 2. MoCo 对比损失 (跨视图语义对齐)
+            
+            # 2. 语义对比损失 (MoCo 自监督)
             loss_moco = contrastive_criterion(outputs)
 
-            # 3. 总损失加权
+            # 总损失加权
             total_loss = args.lambda_moco * loss_moco + args.lambda_sup * loss_sup
 
-            # --- 反向传播 ---
+            # --- Backward & Optimize ---
             model_engine.backward(total_loss)
             model_engine.step()
 
-            # --- 日志打印 ---
-            if step % 10 == 0 and args.local_rank <= 0:
-                # 还可以打印 P_score 的均值来观察模型是否在“偷懒”全预测为0
-                p_mean = outputs["P_score"].mean().item()
-                print(f"Epoch {epoch} | Step {step} | Loss: {total_loss.item():.4f} | "
-                      f"MoCo: {loss_moco.item():.4f} | Sup: {loss_sup.item():.4f} | P_avg: {p_mean:.4f}")
+            # 累积统计量
+            epoch_total_loss += total_loss.item()
+            epoch_moco_loss += loss_moco.item()
+            epoch_sup_loss += loss_sup.item()
 
-        # 保存每轮检查点
+            # --- 实时监控逻辑 ---
+            if step % 10 == 0 and args.local_rank <= 0:
+                p_avg = outputs["P_score"].mean().item()
+                # 检查 P_avg 是否异常（例如全部趋向 0 或 1），预防模型崩塌
+                status_msg = "OK" if 0.01 < p_avg < 0.5 else "WARNING: COLLAPSE?"
+                
+                pbar.set_postfix({
+                    "Loss": f"{total_loss.item():.4f}",
+                    "MoCo": f"{loss_moco.item():.4f}",
+                    "P_avg": f"{p_avg:.3f}",
+                    "Status": status_msg
+                })
+
+        # --- Epoch 结束：模型保存与最优逻辑 ---
+        avg_loss = epoch_total_loss / len(trainloader)
+        
         if args.local_rank <= 0:
-            model_engine.save_checkpoint(save_dir="checkpoints_stage1", tag=f"epoch_{epoch}")
+            print(f"\n>> Epoch {epoch} Finished. Average Loss: {avg_loss:.4f}")
+            
+            # 1. 保存最新的 Checkpoint (DeepSpeed 格式)
+            model_engine.save_checkpoint(checkpoint_dir, tag=f"epoch_{epoch}")
+            
+            # 2. 最优模型替代逻辑
+            if avg_loss < best_loss:
+                print(f"🏆 New Best Loss: {avg_loss:.4f} (Previous: {best_loss:.4f})")
+                best_loss = avg_loss
+                
+                # 保存 DeepSpeed 格式的最优模型
+                model_engine.save_checkpoint(checkpoint_dir, tag="best")
+                
+                # 同时额外保存一份标准的 PyTorch 权重，方便 Stage 2 直接调用
+                best_pt_path = os.path.join(checkpoint_dir, "tics_stage1_best.pt")
+                torch.save(model.state_dict(), best_pt_path)
+                print(f"✅ Best weights synced to {best_pt_path}")
+
+    print("Training Stage 1 completed.")
 
 if __name__ == "__main__":
     main()
