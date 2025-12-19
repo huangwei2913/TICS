@@ -1,5 +1,5 @@
 {
-  "train_micro_batch_size_per_gpu": 8, 
+  "train_micro_batch_size_per_gpu": 8,
   "gradient_accumulation_steps": 1,
   "steps_per_print": 10,
   "optimizer": {
@@ -19,5 +19,12 @@
     "overlap_comm": true,
     "reduce_scatter": true,
     "contiguous_gradients": true
+  },
+  "dataloader_drop_last": true,
+  "wall_clock_breakdown": false,
+  "data_sampling": {
+    "num_workers": 12,
+    "pin_memory": true,
+    "prefetch_factor": 2
   }
 }

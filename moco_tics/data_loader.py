@@ -10,39 +10,41 @@ import pandas as pd
 import os
 import json
 from .TicsAugmentation import TicsAugmentation
-
+import pandas as pd
+import orjson
+from tqdm import tqdm
 
 
 class BoundaryLabelGenerator:
     def __init__(self, fps=50):
         self.fps = fps
 
-    def generate(self, json_path: str, target_frames: int) -> torch.Tensor:
+    def generate(self, data: dict, target_frames: int) -> torch.Tensor:
         """
-        基于给定的帧数生成 0/1 序列
+        不再读磁盘，直接处理传入的内存字典对象
         """
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
+            # 此时 data 已经是 TICSDataset 传进来的字典了
+            if data is None:
+                return torch.zeros(target_frames, dtype=torch.float32)
+
             y_true = torch.zeros(target_frames, dtype=torch.float32)
             words = data.get('words', data.get('word_segments', []))
             
             for word in words:
-                # 提取词边界结束时间
-                end_time = word['end']
                 # 转换到帧索引: frame = time * 50
-                frame_idx = int(round(end_time * self.fps))
+                frame_idx = int(round(word['end'] * self.fps))
                 
-                # 严格边界检查：防止计算出的索引超出特征长度
+                # 严格边界检查
                 if frame_idx < target_frames:
                     y_true[frame_idx] = 1.0
-                elif frame_idx == target_frames: # 容错处理
+                elif frame_idx == target_frames: 
                     y_true[target_frames - 1] = 1.0
                     
             return y_true
         except Exception as e:
-            # 如果 JSON 损坏，返回全 0，防止训练中断
+            # 打印错误方便排查，但返回全 0 保证训练不崩溃
+            print(f"Label generation error: {e}")
             return torch.zeros(target_frames, dtype=torch.float32)
 
 class TICSDataset(Dataset):
@@ -54,7 +56,6 @@ class TICSDataset(Dataset):
         print(f"🔍 正在加载 CSV 文件: {csv_path}")
         # 如果你的 CSV 确实没有表头，用 header=None；如果有，用 header=0
         df = pd.read_csv(csv_path, header=None) 
-        
         # 2. 核心：过滤掉非路径的无效行（比如表头文字）
         # 只有当第一列包含 '/' (路径特征) 且不为空时才保留
         valid_mask = df.iloc[:, 0].str.contains('/', na=False)
@@ -62,7 +63,25 @@ class TICSDataset(Dataset):
         
         self.audio_files = df.iloc[:, 0].tolist()
         self.json_files = df.iloc[:, 1].tolist() 
-        print(f"✅ 数据集加载完成，有效条数: {len(self.audio_files)}")
+        
+        self.cached_json = []
+        print(f"🚀 内存充足，正在预加载 {len(self.json_files)} 条 JSON 特征...")
+        
+        # 预加载循环
+        for json_p in tqdm(self.json_files, desc="Caching JSONs", unit="file"):
+            try:
+                with open(json_p, 'rb') as f:
+                    # 使用 orjson 快速解析二进制流
+                    # 存入列表后，__getitem__ 访问速度是 O(1) 且零磁盘 IO
+                    self.cached_json.append(orjson.loads(f.read()))
+            except Exception as e:
+                print(f"Error loading {json_p}: {e}")
+                # 为了索引对应，加载失败也占个位（或者在之前过滤掉不存在的文件）
+                self.cached_json.append(None)
+
+        print(f"✅ 预加载完成。当前样本总数: {len(self.audio_files)}")
+
+
 
         # 组件初始化
         self.tokenizer = XLMRobertaTokenizer.from_pretrained(xlmr_path)
@@ -76,47 +95,33 @@ class TICSDataset(Dataset):
         try:
             #print(f"DEBUG: [Rank {torch.distributed.get_rank()}] Loading Index: {idx}")
             audio_path = self.audio_files[idx]
-            json_path = self.json_files[idx]
-
+            json_data = self.cached_json[idx]
             # --- 关键调试点：如果还是报错，这里会打印出具体的路径内容 ---
-            if not os.path.exists(json_path):
-                # 针对 400 万数据：跳过损坏样本，递归取下一个
-                print(f"⚠️ 找不到 JSON.......: {json_path}，尝试下一条...")
+            if json_data is None:
+            # 实际生产中建议返回一个 dummy 样本或在 init 中剔除错误
                 return self.__getitem__((idx + 1) % len(self))
 
-            # 1. 加载元数据
-            with open(json_path, 'r') as f:
-                meta = json.load(f)
 
             # 2. 加载音频
             if not os.path.exists(audio_path):
                 return self.__getitem__((idx + 1) % len(self))
                 
             waveform, sr = torchaudio.load(audio_path)
-            
-            # 重采样处理 (如果磁盘文件不是 16k)
-            if sr != self.sample_rate:
-                resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-                waveform = resampler(waveform)
-
-            # 强制单声道
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-                
+             
             # 3. 计算 HuBERT 帧数并过滤超短音频
             target_T = waveform.shape[1] // 320
             if target_T <= 1: 
                 return self.__getitem__((idx + 1) % len(self))
 
             # 4. 生成标签 (传入 json_path 或 meta，取决于你 Generator 的实现)
-            y_true = self.label_gen.generate(json_path, target_T)
+            y_true = self.label_gen.generate(json_data, target_T)
 
             # 5. 生成增强视图
             view1 = self.augmentor(waveform, is_view2=False)
             view2 = self.augmentor(waveform, is_view2=True)
 
             if self.stage == 2:
-                text = meta.get('text', "")
+                text = json_data.get('text', "")
                 encoded_text = self.tokenizer(
                     text,
                     padding='max_length',

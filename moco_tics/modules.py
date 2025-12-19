@@ -333,6 +333,7 @@ def segment_pooling_with_durations(sequence_features: torch.Tensor, hard_boundar
     B, T, D = sequence_features.shape
     device = sequence_features.device
 
+    
     # --- Step 1: 生成 Segment ID ---
     shift_boundaries = torch.cat([torch.zeros((B, 1), device=device), hard_boundaries[:, :-1]], dim=1)
     seg_ids = torch.cumsum(shift_boundaries, dim=1).long() # (B, T)

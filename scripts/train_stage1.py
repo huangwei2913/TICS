@@ -9,6 +9,9 @@ from moco_tics.data_loader import TICSDataset, tics_collate_fn
 from tqdm import tqdm
 import os
 from moco_tics.TicsAugmentation import TicsAugmentation
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
 
 # 确保 Y_true 和 P_score 的长度对齐
 class BoundaryLoss(nn.Module):
@@ -50,29 +53,43 @@ class TICSContrastiveLoss(nn.Module):
         return (loss_a + loss_b) / 2
 
     def _compute_segment_loss(self, q, k, mask):
-        """
-        q, k: (S, B, D)
-        mask: (B, S) -> True 表示是 padding
-        """
-        # 1. 转换维度为 (B, S, D) 方便与 mask 对应
-        q = q.transpose(0, 1) 
-        k = k.transpose(0, 1)
+            """
+            高性能、高强度版本：
+            1. 修复长度不匹配 Bug (s_min)
+            2. 实现分段级对比学习 (Flatten Contrast)
+            """
+            # [维度转换] 从 (S, B, D) 变为 (B, S, D)
+            q, k = q.transpose(0, 1), k.transpose(0, 1)
+            
+            # [Bug 修复] 强制对齐序列长度，防止 441 vs 440 报错
+            s_min = min(q.size(1), k.size(1), mask.size(1))
+            q, k, mask = q[:, :s_min, :], k[:, :s_min, :], mask[:, :s_min]
+
+            # [上强度核心] 展平所有 Batch 里的有效片段
+            # valid_indices 是一个 (B, S) 的布尔矩阵
+            valid_indices = ~mask 
+            
+            # 提取有效片段：结果维度为 (N_total_valid_segments, D)
+            # 这一步会自动把 Batch 维度和 Seq 维度压平，只留下真实的语音向量
+            q_valid = q[valid_indices] 
+            k_valid = k[valid_indices]
+
+            # 安全检查
+            if q_valid.size(0) == 0:
+                return torch.tensor(0.0, device=q.device, requires_grad=True)
+
+            # [计算相似度矩阵] (N_total, D) @ (D, N_total) -> (N_total, N_total)
+            # 每个片段都要和 Batch 内所有其他片段做对比
+            logits = torch.matmul(q_valid, k_valid.T) / self.temperature
+            
+            # [构造标签] 对角线位置即为正样本（对应的片段）
+            labels = torch.arange(q_valid.size(0), device=q.device)
+
+            # 返回 CrossEntropy Loss
+            return F.cross_entropy(logits, labels)
         
-        # 2. 我们使用 Mean Pooling 得到句子级表示进行对比 (Stage 1 推荐做法)
-        # 或者如果你想做更细粒度的片段对比，可以使用 mask 过滤
-        # 这里采用带 Mask 的平均池化，比单纯的 .mean(dim=0) 更准确
-        fill_mask = mask.unsqueeze(-1).expand_as(q) # (B, S, D)
-        q_masked = q.clone().masked_fill(fill_mask, 0.0)
-        k_masked = k.clone().masked_fill(fill_mask, 0.0)
-        
-        valid_counts = (~mask).sum(dim=1, keepdim=True).clamp(min=1) # 每个 batch 有多少有效片段
-        q_avg = q_masked.sum(dim=1) / valid_counts
-        k_avg = k_masked.sum(dim=1) / valid_counts
-        
-        # 3. 标准 MoCo 对比计算 (针对 Batch)
-        logits = torch.matmul(q_avg, k_avg.T) / self.temperature
-        labels = torch.arange(q_avg.shape[0], device=q.device)
-        return F.cross_entropy(logits, labels)
+
+
 
 
 def parse_args():
@@ -82,7 +99,7 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lambda_sup', type=float, default=1.0)
     parser.add_argument('--lambda_moco', type=float, default=0.5)
-    parser.add_argument('--aug_mode', type=str, default="baseline")
+    parser.add_argument('--aug_mode', type=str, default="shuffle")
     parser = deepspeed.add_config_arguments(parser)
     return parser.parse_args()
 
@@ -110,27 +127,22 @@ def main():
         teacher_config=TEACHER_CONFIG
     )
 
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+
     # 3. 数据准备
     train_dataset = TICSDataset(csv_path=args.csv_path, augmentor=augmentor, stage=1)
 
-    #print("✅ 数据集创建完成，长度:", len(train_dataset))
-    #test_loader = DataLoader(train_dataset, batch_size=1, collate_fn=tics_collate_fn, num_workers=0)
-    #test_batch = next(iter(test_loader))
-    #print("✅ 单batch加载成功！Keys:", list(test_batch.keys()))
-    #print("view1 shape:", test_batch["view1"].shape if "view1" in test_batch else "无view1")
-    #del test_loader, test_batch
-    #print("✅ 数据集测试通过")
-    # ===== 结束添加 =====
-    
     # 4. DeepSpeed 初始化
     # model_engine 处理分布式训练、FP16 混合精度和优化器更新
     model_engine, optimizer, trainloader, _ = deepspeed.initialize(
         args=args,
         model=model,
         model_parameters=model.parameters(),
-        training_data=train_dataset,
+        training_data=train_dataset,  # ✅ 恢复这个！
         collate_fn=tics_collate_fn,
     )
+    
 
     # 5. 损失函数定义
     contrastive_criterion = TICSContrastiveLoss(temperature=0.1).to(model_engine.device)
@@ -157,8 +169,8 @@ def main():
             y_mask = batch.get("y_mask", torch.ones_like(y_true)).to(model_engine.device)
 
             # --- Forward ---
-            outputs = model_engine(view1, view2)
-
+            #outputs = model_engine(view1, view2)
+            outputs = model_engine(view1, view2, aug_mode=args.aug_mode)
             # --- Loss 计算 ---
             # 1. 边界发现损失 (监督学习)
             loss_sup = boundary_criterion(outputs["P_score"], y_true, mask=y_mask)

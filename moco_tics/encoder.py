@@ -115,6 +115,7 @@ class EnhancedSegmentEncoder(nn.Module):
         padding_mask: [Batch, Seq] (True 为 padding)
         """
         x = self.input_projection(segments)
+        durations = durations.to(x.dtype)
         x = x + self.duration_embed(durations)
         
         for layer in self.layers:
