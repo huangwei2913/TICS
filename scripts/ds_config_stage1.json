@@ -1,6 +1,7 @@
 {
   "train_micro_batch_size_per_gpu": 8,
   "gradient_accumulation_steps": 1,
+  "gradient_clipping": 1.0,
   "steps_per_print": 10,
   "optimizer": {
     "type": "Adam",
@@ -22,6 +23,10 @@
   },
   "dataloader_drop_last": true,
   "wall_clock_breakdown": false,
+  "comms_logger": {
+    "enabled": false
+  },
+  "distributed_timeout": 3600,
   "data_sampling": {
     "num_workers": 12,
     "pin_memory": true,

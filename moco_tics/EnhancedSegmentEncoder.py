@@ -123,7 +123,7 @@ class EnhancedSegmentEncoder(nn.Module):
             
         return x # 输出 [Seq, Batch, 1024]
 
-    def load_pretrained_weights(self, large_checkpoint_path="/mnt/facebook/hubert-large-ls960-ft", start_layer=6):
+    def load_pretrained_weights(self, large_checkpoint_path="/mnt/conda_data/facebook/hubert-large-ls960-ft", start_layer=6):
         """
         精准加载 Hubert-Large-LS960-FT 的权重到增强型架构
         """
