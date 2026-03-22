@@ -12,7 +12,8 @@ from tqdm import tqdm
 from moco_tics.TICSUnifiedDataset import TICSUnifiedDataset, collate_fn_unified
 from moco_tics.TICSMoCo import TICS_MoCo
 from moco_tics.TICSLossCriterion import TICSLossCriterion
-
+os.environ["NCCL_BLOCKING_WAIT"] = "1" 
+os.environ["NCCL_TIMEOUT"] = "1800" # 统一为 30 分钟
 import logging
 
 # --- 在 main() 的开始部分初始化日志 ---
@@ -79,13 +80,19 @@ def main():
         is_stage2=True
     )
 
+# 初始化全功能 Loss
     criterion = TICSLossCriterion(
-        pos_weight=15.0, # 针对边界稀疏性
-        alpha=1.0, beta=2.0, gamma=1.0, delta=0.8 # 各 Loss 权重
+        pos_weight=15.0, 
+        alpha=1.0,   # Boundary
+        beta=1.0,    # MoCo
+        gamma=0.1,   # MSE (语义脑补)
+        lambda_k=0.5 # Count (数量回归)
     ).to(device)
 
-    pt_files = glob.glob(os.path.join(args.pt_dir, "**/*.pt"), recursive=True)
-    dataset = TICSUnifiedDataset(pt_files, xlmr_model_path="/mnt/conda_data/facebook/xlm-roberta-base")
+    #pt_files = glob.glob(os.path.join(args.pt_dir, "**/*.pt"), recursive=True)
+    pt_files = args.pt_dir
+    csv_path=pt_files
+    dataset = TICSUnifiedDataset(csv_path, xlmr_model_path="/mnt/conda_data/facebook/xlm-roberta-base")
     sampler = DistributedSampler(dataset)
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, sampler=sampler,
@@ -136,43 +143,62 @@ def main():
             )
 
             # 计算多维度 Loss
-            loss, loss_dict = criterion(model_output, batch)
-            # --- DEBUG 打印 ---
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n[RANK {local_rank} FATAL] Loss is NaN!")
-                print(f"Details: {loss_dict}")
-                continue # 跳过这一步，不要backward，防止污染模型权重
-            # 反向传播 (DeepSpeed 自动处理 scale_loss)
-            model_engine.backward(loss)
-            model_engine.step()
+            loss_dict = criterion(model_output, batch, model_engine.module.queue)
+            total_loss = loss_dict["loss"]
+            # --- C. 反向传播与优化 ---
+            if not (torch.isnan(total_loss) or torch.isinf(total_loss)):
+                model_engine.backward(total_loss)
+                model_engine.step()
+                
+                # --- D. 【核心修改】更新 MoCo 队列 ---
+                # 必须在 step() 之后更新，且只需使用教师产出的 k_m
+                with torch.no_grad():
+                    model_engine.module._dequeue_and_enqueue(model_output["k_m"])
+            else:
+                if local_rank == 0: print(f"⚠️ Warning: NaN Loss at Step {step}")
+                continue
 
             # --- 7. 日志与监控 ---
             if local_rank == 0 and step % args.log_steps == 0:
-                # 记录 Tensorboard
+                # Tensorboard 记录
                 for name, val in loss_dict.items():
+                    if isinstance(val, torch.Tensor): val = val.item()
                     writer.add_scalar(f"Loss/{name}", val, epoch * len(dataloader) + step)
                 
-                # 特色监控：预测 K 值 vs 真实 K 值
+                # 计算 K 值偏差
                 avg_pred_k = model_output['pred_k'].mean().item()
                 avg_target_k = batch['target_k'].mean().item()
-                writer.add_scalar("Monitor/Pred_K", avg_pred_k, epoch * len(dataloader) + step)
-                writer.add_scalar("Monitor/Target_K", avg_target_k, epoch * len(dataloader) + step)
 
-                # 3. 【重点修改】详细化的进度条打印
-                # 这里我们直接从 loss_dict 中取值，并保留 3 位小数
-                # B: 边界损失, D: 蒸馏损失, C: 数量预测损失
+                # 精简后的进度条打印 (B:Boundary, M:MoCo, S:Semantic/MSE, C:Count)
                 pbar.set_description(
                     f"Epoch {epoch} | "
-                    f"L:{loss.item():.3f} | "
-                    f"B:{loss_dict['bnd']:.3f} | "
-                    f"D:{loss_dict['dist']:.3f} | "
-                    f"C:{loss_dict['count']:.3f} | "
-                    f"K:{avg_pred_k:.1f}/{avg_target_k:.1f}"
+                    f"Loss:{total_loss.item():.3f} | "
+                    f"B:{loss_dict['loss_boundary']:.3f} | "
+                    f"M:{loss_dict['loss_moco']:.3f} | "
+                    f"S:{loss_dict['loss_mse']:.3f} | "
+                    f"C:{loss_dict['loss_count']:.3f} | "
+                    f"K_Acc:{avg_pred_k:.1f}/{avg_target_k:.1f}"
                 )
             # --- 8. 按步保存 (保存到 /dev/shm) ---
+
             if step > 0 and step % args.save_steps == 0:
+                # [屏障 1]: 确保所有卡都跑完了这一步的计算，准备好保存
+                dist.barrier() 
+                
+                if local_rank == 0:
+                    print(f"--- All ranks reached checkpoint trigger at step {step}. Starting save... ---")
+
+                # 【关键点】: 不要放在 if local_rank == 0 里面！
+                # DeepSpeed 的 save_checkpoint 内部会自动处理多卡的同步和分片写入。
+                # 所有 Rank 必须一起调用它。
                 client_sd = {'epoch': epoch, 'step': step}
                 model_engine.save_checkpoint(shm_checkpoint_dir, client_state=client_sd)
+
+                # [屏障 2]: 确保所有卡都写完了自己的分片，再一起往后走
+                dist.barrier()
+                
+                if local_rank == 0:
+                    print(f"--- Step {step} checkpoint saved successfully. Resuming training... ---")
 
         # --- 9. Epoch 结束保存 (持久化到硬盘) ---
         dist.barrier()

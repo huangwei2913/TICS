@@ -7,96 +7,90 @@ class TICSLossCriterion(nn.Module):
                  pos_weight=15.0, 
                  label_smoothing_kernel=5, 
                  alpha=1.0,  # Boundary 权重
-                 beta=1000.0,   # Distillation 权重
-                 gamma=1.0,  # Count 权重
-                 delta=0.8): # Emotion 权重
+                 beta=1.0,   # MoCo 权重
+                 gamma=0.1,  # MSE 权重
+                 lambda_k=0.5, # Count (pred_k) 权重
+                 temp=0.07):
         super().__init__()
-        # 1. 初始化你设计的物理边界损失
+        # 1. 物理边界损失
         self.boundary_loss_fn = BoundaryLoss(
             pos_weight=pos_weight, 
             label_smoothing_kernel=label_smoothing_kernel
         )
         
-        # 2. 其他基础损失函数
-        self.count_loss_fn = nn.SmoothL1Loss(reduction='mean')
-        self.mse_loss_fn = nn.MSELoss(reduction='mean')
+        # 2. 基础配置
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.lambda_k = lambda_k
+        self.temp = temp
         
-        # 权重配置
-        self.weights = {'alpha': alpha, 'beta': beta, 'gamma': gamma, 'delta': delta}
+        # 3. 回归损失器
+        self.mse_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss() # 预测数量通常用 L1 更平滑
 
-    def compute_emotion_consistency(self, anchors, target_emo, mask):
+    def forward(self, model_output, batch, queue):
         """
-        [情感一致性损失] 基于样本内部对齐
-        anchors: [B, S, 1024] - 模型精炼出的语义锚点
-        target_emo: [B, T, 1024] - emotion2vec 真值特征
-        mask: [B, T] - 物理帧掩码
+        model_output: TICS_MoCo 的输出字典
+        batch: 含有 'y_boundary', 'mask', 'target_k' 的 batch 数据
+        queue: 模型内部维护的负样本队列 [512, K]
         """
-        # 计算音频全局情感基调 (样本内均值)
-        # target_emo_global: [B, 1024]
-        denom = mask.sum(1, keepdim=True) + 1e-8
-        target_emo_global = (target_emo * mask.unsqueeze(-1)).sum(1) / denom
+        device = model_output['p_score'].device
         
-        # 计算当前所有锚点的语义平均表示
-        # anchor_summary: [B, 1024]
-        anchor_summary = anchors.mean(dim=1) 
-        
-        # 样本内对齐: 确保语义锚点捕获了原始语音的情感精髓
-        loss_emo = (1 - F.cosine_similarity(anchor_summary, target_emo_global, dim=-1, eps=1e-5)).mean()
-        return loss_emo
-
-    def forward(self, model_output, batch):
-        """
-        model_output: TICS_MoCo forward 的输出
-        batch: Dataset/Collate 的输出
-        """
-        # 获取基础信息
-        mask = batch['mask'] # [B, T]
-        
-        # --- A. 物理边界损失 (使用你设计的 BoundaryLoss) ---
-        # p_score 应该是 Sigmoid 后的概率，如果模型输出是 Logits，请确保经过了 Sigmoid
+        # --- [1] 物理边界损失 (Boundary) ---
         p_score = torch.sigmoid(model_output['p_score']) 
-        loss_bnd = self.boundary_loss_fn(p_score, batch['y_boundary'], mask)
+        loss_bnd = self.boundary_loss_fn(p_score, batch['y_boundary'], batch['mask'])
 
-        # 阶段检查：如果没有文本导师（推理或 Stage 1），直接返回
-        if model_output["text_global"] is None:
-            return loss_bnd, {"total": loss_bnd.item(), "bnd": loss_bnd.item()}
+        # --- [2] 全局对齐损失 (MoCo InfoNCE) ---
+        q = model_output["q"]       # [B, 512]
+        k = model_output["k_m"]     # [B, 512]
+        
+        # 正样本
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        # 负样本 (从传入的 queue 中拿)
+        l_neg = torch.einsum('nc,ck->nk', [q, queue.detach()]) 
+        
+        logits = torch.cat([l_pos, l_neg], dim=1) / self.temp
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
+        loss_moco = F.cross_entropy(logits, labels)
 
-        # --- B. 全局语义蒸馏损失 (脑补对齐) ---
-        audio_g = model_output['audio_global']
-        text_g = model_output['text_global']
-        T = 0.1 
+        # --- [3] 语义脑补损失 (MSE) ---
+        pred_1024 = model_output["audio_global_pred"]
+        target_1024 = model_output["text_global_online"]
+        if target_1024 is None:
+            # 制造一个全 0 的 target，但不需要梯度
+            target_1024 = torch.zeros_like(pred_1024).detach()
+            # 设置一个 flag，标记这次 loss 无效
+            valid_mask = 0.0
+        else:
+            valid_mask = 1.0
 
-        # 归一化特征
-        audio_g_norm = F.normalize(audio_g, p=2, dim=-1)
-        text_g_norm = F.normalize(text_g, p=2, dim=-1)
-        cos_sim = (audio_g_norm * text_g_norm).sum(dim=-1) / T
-        loss_dist = (1.0 - torch.sigmoid(cos_sim)).mean()
-        loss_mse = F.mse_loss(audio_g, text_g)
-        loss_dist = (1.0 - F.cosine_similarity(audio_g, text_g, dim=-1)).mean() + 2.0 * loss_mse
-  
+        # 始终计算 MSE，保持计算图连接
+        raw_mse = self.mse_loss(pred_1024, target_1024.detach())
+        # 如果无效，乘以 0，梯度阻断；如果有效，乘以 1
+        loss_mse = raw_mse * valid_mask    
+    
 
-        # --- C. 篇章结构损失 (Count 回归) ---
-        loss_count = self.count_loss_fn(model_output['pred_k'], batch['target_k'])
+        # --- [4] 精炼计数损失 (Count Loss) ---
+        # 预测的 k (pred_k) vs 真实的句子数量 (n_sentences)
+        # 假设 batch['n_sentences'] 是 [B] 的长整型 Tensor
+        target_k = batch['target_k'].float()
+        loss_count = self.l1_loss(model_output['pred_k'], target_k)
+        
+        # --- [5] 总损失聚合 ---
+        total_loss = (self.alpha * loss_bnd) + \
+                     (self.beta * loss_moco) + \
+                     (self.gamma * loss_mse) + \
+                     (self.lambda_k * loss_count)
 
-        # --- D. 情感一致性损失 (基于 emotion2vec 对齐) ---
-        # loss_emo = self.compute_emotion_consistency(
-        #     model_output['anchors'], 
-        #     batch['target_emo'], 
-        #     mask
-        # )
-        loss_emo = torch.tensor(0.0, device=loss_bnd.device, dtype=loss_bnd.dtype)
-        # --- 总损失聚合 ---
-        total_loss = (self.weights['alpha'] * loss_bnd + 
-                      self.weights['beta'] * loss_dist + 
-                      self.weights['gamma'] * loss_count )
-        #+ 
-         #             self.weights['delta'] * loss_emo)
-
-        return total_loss, {
-            "total": total_loss.item(),
-            "bnd": loss_bnd.item(),
-            "dist": loss_dist.item(),
-            "count": loss_count.item(),
-            "emo": 0.0,
-            "pred_k_avg": model_output['pred_k'].mean().item() # 方便监控预测偏好
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"[Warning] NaN loss detected! Masking to 0.")
+            total_loss = total_loss * 0.0
+            
+        return {
+            "loss": total_loss,
+            "loss_boundary": loss_bnd,
+            "loss_moco": loss_moco,
+            "loss_mse": loss_mse,
+            "loss_count": loss_count
         }
